@@ -52,6 +52,29 @@ pub fn along(frac: u16, len: i32) -> i32 {
     (f * (len - 1) as f32).round() as i32
 }
 
+/// Bounding box of display rectangles `(x, y, width, height)`.
+///
+/// Empty and non-positive sizes are ignored. The origin may be negative when a
+/// display sits to the left or above the main display.
+pub fn union_desktop(rects: &[(i32, i32, i32, i32)]) -> Option<(i32, i32, i32, i32)> {
+    let mut iter = rects
+        .iter()
+        .copied()
+        .filter(|(_, _, w, h)| *w > 0 && *h > 0);
+    let (x, y, w, h) = iter.next()?;
+    let mut min_x = x;
+    let mut min_y = y;
+    let mut max_x = x.saturating_add(w);
+    let mut max_y = y.saturating_add(h);
+    for (x, y, w, h) in iter {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x.saturating_add(w));
+        max_y = max_y.max(y.saturating_add(h));
+    }
+    Some((min_x, min_y, (max_x - min_x).max(2), (max_y - min_y).max(2)))
+}
+
 /// `peer` is the side of *this* desktop where the other computer sits.
 ///
 /// The desktop is the bounding rectangle of every attached monitor. A second
@@ -173,6 +196,14 @@ impl RemoteCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn union_includes_a_display_left_of_the_main_panel() {
+        let (x, y, w, h) = union_desktop(&[(-2560, 0, 2560, 1440), (0, 80, 1512, 982)]).unwrap();
+        assert_eq!((x, y, w, h), (-2560, 0, 2560 + 1512, 1440));
+        assert!(union_desktop(&[]).is_none());
+        assert!(union_desktop(&[(0, 0, 0, 10)]).is_none());
+    }
 
     #[test]
     fn right_edge_hit_and_return() {

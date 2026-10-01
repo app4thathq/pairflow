@@ -10,6 +10,7 @@
 
 use pairflow_proto::{InputEvent, Side};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::Mutex;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
@@ -34,6 +35,11 @@ pub(crate) trait Platform: Send {
     /// Backends use this so a full event queue cannot drop the edge position.
     fn take_pointer(&self) -> Option<InputEvent> {
         None
+    }
+    /// Relative motion summed since the previous call. Exclusive grabs must use
+    /// this so a full event queue cannot drop cursor travel.
+    fn take_motion(&self) -> Option<InputEvent> {
+        take_motion_accum()
     }
     /// Which desktop edge faces the peer. Windows uses this to claim that edge.
     fn set_stick_side(&self, _side: Side) {}
@@ -128,7 +134,11 @@ impl Input {
 
     pub fn try_recv(&self) -> Option<InputEvent> {
         // Pointer samples must not wait behind a burst of key events.
+        // Summed relative motion is next, so a full key queue cannot drop it.
         if let Some(ev) = self.ops.take_pointer() {
+            return Some(ev);
+        }
+        if let Some(ev) = self.ops.take_motion() {
             return Some(ev);
         }
         self.event_rx.try_recv().ok()
@@ -137,7 +147,7 @@ impl Input {
     pub fn recv_timeout(&self, timeout: Duration) -> Option<InputEvent> {
         match self.event_rx.recv_timeout(timeout) {
             Ok(ev) => Some(ev),
-            Err(_) => self.ops.take_pointer(),
+            Err(_) => self.ops.take_pointer().or_else(|| self.ops.take_motion()),
         }
     }
 
@@ -162,6 +172,29 @@ impl Input {
 impl Drop for Input {
     fn drop(&mut self) {
         self.ops.shutdown();
+    }
+}
+
+/// Exclusive-mode cursor travel. Summed so a full event channel cannot drop it.
+static MOTION: Mutex<(i32, i32)> = Mutex::new((0, 0));
+
+pub(crate) fn add_motion(dx: i32, dy: i32) {
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    let mut guard = MOTION.lock().unwrap();
+    guard.0 = guard.0.saturating_add(dx);
+    guard.1 = guard.1.saturating_add(dy);
+}
+
+fn take_motion_accum() -> Option<InputEvent> {
+    let mut guard = MOTION.lock().unwrap();
+    let (dx, dy) = *guard;
+    *guard = (0, 0);
+    if dx == 0 && dy == 0 {
+        None
+    } else {
+        Some(InputEvent::MouseMove { dx, dy })
     }
 }
 

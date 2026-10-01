@@ -7,18 +7,24 @@ approve it once:
 1. Open this volume.
 2. Drag Pairflow to Applications if you want it to stay.
 3. Control-click Pairflow and choose Open, then Open again.
-4. Choose Host or Join. A Terminal window shows the pairing code and status.
+4. Pairflow lives in the menu bar (no Dock icon, no Terminal).
+   Choose Host, or Join… and type the 5-character code.
+   Quit exits. Closing the status window leaves Pairflow running.
+
+The next time you open Pairflow on the computer that joined, it reconnects
+to the same code by itself. The host keeps advertising that code.
 
 Accessibility
 -------------
 
 Sharing the keyboard and mouse needs Accessibility permission (and, on recent
-macOS, Input Monitoring):
+macOS, Input Monitoring). Grant it to Pairflow, the app you opened — not to
+Terminal:
 
 System Settings → Privacy & Security → Accessibility → enable Pairflow.
 
-If the event tap fails, the app prints that permission error and falls back to
-dry-run mode (stdin commands only).
+The guest pointer covers every display on this Mac, including a screen that
+sits to the left of the built-in panel.
 
 Terminal use
 ------------

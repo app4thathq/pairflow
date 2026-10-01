@@ -14,7 +14,7 @@
 //! themselves never fire, the same poll still reports position and, once the
 //! pointer is remote, relative motion.
 
-use super::{Input, InputError, Platform};
+use super::{add_motion, Input, InputError, Platform};
 use pairflow_proto::{InputEvent, KeyId, MouseButton, Side};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
@@ -305,7 +305,7 @@ fn sample_cursor() {
         let dx = pt.x - ax;
         let dy = pt.y - ay;
         if dx != 0 || dy != 0 {
-            emit(InputEvent::MouseMove { dx, dy });
+            add_motion(dx, dy);
             IN_WARP.store(true, Ordering::Relaxed);
             unsafe {
                 let _ = SetCursorPos(ax, ay);
@@ -444,7 +444,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 let dx = info.pt.x - ax;
                 let dy = info.pt.y - ay;
                 if dx != 0 || dy != 0 {
-                    emit(InputEvent::MouseMove { dx, dy });
+                    add_motion(dx, dy);
                     HOOK_MOVE_SEQ.fetch_add(1, Ordering::Release);
                     IN_WARP.store(true, Ordering::Relaxed);
                     let _ = SetCursorPos(ax, ay);

@@ -11,7 +11,7 @@ pub mod state;
 
 pub use code::{generate_code, normalize_code, CODE_LEN};
 pub use discovery::{browse, machine_name, Advertiser, Announce, Candidate};
-pub use gate::Screen;
+pub use gate::{union_desktop, Screen};
 pub use session::{connect_authenticated, HostListener, Session};
 pub use share::{ClientEffect, ClientShare, HostEffect, HostShare};
-pub use state::{hex_encode, Identity};
+pub use state::{hex_encode, Identity, LaunchAction};

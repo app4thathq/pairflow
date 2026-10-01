@@ -15,14 +15,20 @@ are deliberately not built yet.
 - Two roles: `host` (physical keyboard and mouse) and `join` (the other machine).
 - One peer. The peer sits on one edge of the host screen: left, right, top, or bottom.
 - Relative mouse motion, buttons, wheel, and a practical set of keys.
+  The guest places that motion with an absolute warp across every attached
+  display. A sensitivity multiplier defaults to 1.0 (host cursor travel).
 - Pairing with a 5-character code. The code is not sent on the wire.
 - Discovery by mDNS and by UDP broadcast. Neither advertisement contains the code.
 - An encrypted TCP session (X25519, HKDF, ChaCha20-Poly1305).
 - Reconnect when the TCP session drops. The host keeps the same code and a stable
   host id, so a new DHCP address does not force a new pairing.
 - Linux (X11), Windows, and macOS input backends.
-- Installable artifacts: a Windows `.exe`, a macOS `.dmg` containing `Pairflow.app`,
-  and a Linux AppImage. CI builds all three.
+- Installable artifacts: a Windows tray `.exe` (plus a console CLI), a macOS
+  `.dmg` containing a menu-bar `Pairflow.app`, and a Linux AppImage. CI builds
+  all three. Double-click starts the tray app.
+- The guest remembers the last pairing code and host id. Opening the tray app
+  again joins that host without asking. A machine that last hosted resumes
+  hosting with the same code.
 
 **Not in this version**
 
@@ -30,10 +36,8 @@ are deliberately not built yet.
 - Clipboard, drag-and-drop, and file transfer.
 - Native Wayland capture (see below). XWayland can work, with weaker grabs.
 - Choosing which physical monitor borders the peer. The peer is the outer
-  edge of the whole desktop. Mixed-DPI gaps inside that rectangle are not
-  modeled.
-- A full GUI. The macOS app opens Terminal; other platforms are a command-line
-  program with a status log.
+  edge of the whole host desktop. Mixed-DPI gaps inside a bounding rectangle
+  are not modeled.
 - The optional relay. The design is below; there is no server.
 - Code signing, notarization, and a Windows MSI. The Windows build is a portable
   executable. The macOS build is unsigned.
@@ -41,7 +45,7 @@ are deliberately not built yet.
 ## Components
 
 ```
-apps/pairflow            CLI: host and join loops, stdin controls
+apps/pairflow            pairflow-gui (tray) and pairflow (CLI): host and join
 crates/pairflow-input    capture and injection per OS
 crates/pairflow-core     codes, discovery, handshake, share state machine
 crates/pairflow-proto    message layout and logical key ids
@@ -173,10 +177,24 @@ from the last known position crosses it, the host:
 3. Replays currently held modifiers so shortcuts survive the crossing.
 
 While the pointer is remote, relative motion, buttons, wheel, and keys are
-forwarded. The client warps its cursor to the entry point and injects clamped
-deltas. If a delta would cross back over the entry edge, the client injects
-only the part that stays on screen and sends `Leave` with the new fraction.
-The host drops the grab and warps its cursor 24 pixels inside the same edge.
+forwarded. Exclusive capture sums those deltas in the process instead of
+dropping them when the event channel is full, because a dropped delta is
+travel the cursor never gets back (the host warps its own pointer to an
+anchor). The client adds the summed delta, scaled by sensitivity (default
+1.0, clamped to 0.1–8), to a cursor clamped to the guest desktop, then warps
+to that absolute point. A relative inject would be clamped by the OS to the
+display currently under the cursor, which both confined the pointer to one
+monitor and threw away the rest of the swipe. If a delta would cross back
+over the entry edge, the client sends `Leave` with the new fraction. The host
+drops the grab and warps its cursor 24 pixels inside the same edge.
+
+The guest desktop is the union of attached displays in pointer coordinates,
+origin allowed to be negative. On macOS that union is `CGDisplay` bounds in
+points, not the pixel size of the main display. Enter from the host's right
+edge arrives on the guest's left, which is the external screen when that
+screen sits to the left of the Mac panel. Empty pixels between displays of
+different heights are inside the bounding rectangle; they are not a separate
+layout. The join log prints `guest desktop: WxH at (x,y)`.
 
 `Ctrl+Alt+F12` on the host forces the same return and releases modifiers on
 the client so they do not stick. `Ctrl+Alt+Enter` and `Ctrl+Alt+Right` force
@@ -193,8 +211,10 @@ keyboard can still type locally and fight the injected stream.
 
 ### Linux (X11)
 
-`x11rb`'s pure-Rust connection talks to the X server on `DISPLAY`. There is no
-libX11 dependency, which keeps the AppImage small.
+`x11rb`'s pure-Rust connection talks to the X server on `DISPLAY`. Capture
+does not link libX11. The tray app does: the AppImage's GUI needs `libdbus-1`,
+`libX11`, `libGL`, and `libxkbcommon`, which a normal desktop session has.
+The CLI binary in the same image does not.
 
 - Screen size comes from the connection setup.
 - While the pointer is local, the backend polls `QueryPointer` and selects
@@ -242,34 +262,41 @@ not see input on the secure desktop (the lock screen, UAC prompts).
   the warp.
 - Events with the injected flag are ignored so the client's own `SendInput`
   is not captured again.
-- Injection is `SendInput`: relative `MOUSEEVENTF_MOVE`, button flags, wheel
-  data in `WHEEL_DELTA` units, and virtual keys. Extended keys (arrows, right
-  Ctrl, and so on) set `KEYEVENTF_EXTENDEDKEY`.
+- Injection is `SendInput`: an absolute move when the guest is placing the
+  remote cursor, button flags, wheel data in `WHEEL_DELTA` units, and virtual
+  keys. Extended keys (arrows, right Ctrl, and so on) set
+  `KEYEVENTF_EXTENDEDKEY`. Hook deltas come from `MSLLHOOKSTRUCT.pt`, which
+  is the cursor position after Windows has applied its own acceleration.
 
-The artifact is `pairflow-windows-x86_64.exe`, a portable executable. No MSI.
+The double-click artifact is `pairflow-windows-x86_64.exe`, the tray app
+(`pairflow-gui`, Windows subsystem, no console). `pairflow-cli.exe` is the
+console binary. Both get the DPI manifest. No MSI.
 
 ### macOS
 
 A `CGEventTap` at the HID insertion point watches mouse, key, scroll, and
 flag-changed events. Returning `CallbackResult::Drop` swallows them while the
 pointer is remote. `CGDisplay::warp_mouse_cursor_position` parks the cursor
-without generating a new event. Injection posts `CGEvent`s: absolute mouse
-position, buttons, line-based scroll, and virtual keycodes.
+without generating a new event. The guest desktop is the union of
+`CGDisplay::active_displays()` bounds in points. Injection posts `CGEvent`s
+for buttons, line-based scroll, and virtual keycodes, and warps to the
+absolute pointer position so a move can leave the display under the cursor.
 
 **Permission.** `CGEventTapCreate` fails unless the process is trusted for
-Accessibility. An `.app` bundle is what System Settings lists. The dmg's
+Accessibility. An `.app` bundle is what System Settings lists, and the bundle
+executable is the tray Mach-O (`pairflow-gui`), not a shell script. The dmg's
 "How to open" file says to Control-click → Open because the build is unsigned,
 then enable Pairflow under Privacy & Security → Accessibility. Recent macOS
 versions may also ask for Input Monitoring. There is no notarization and no
-Developer ID signature in CI.
+Developer ID signature in CI. `LSUIElement` is set, so the app is a menu-bar
+extra.
 
 Modifier keys on macOS arrive as `FlagsChanged` rather than key up/down. The
 backend diffs the flag word and emits the logical modifier keys.
 
-The dmg contains a universal binary (`lipo` of `aarch64-apple-darwin` and
-`x86_64-apple-darwin`). Double-click runs an AppleScript prompt and then the
-CLI in Terminal. `Pairflow.app/Contents/MacOS/pairflow-cli` is the same binary
-for shell use.
+The dmg contains universal binaries (`lipo` of `aarch64-apple-darwin` and
+`x86_64-apple-darwin`) for the tray app and the CLI.
+`Pairflow.app/Contents/MacOS/pairflow-cli` is the shell binary.
 
 ## Reconnect model
 
@@ -279,7 +306,7 @@ for shell use.
 | Host process restart, code not rotated | Same. The code and host id were loaded from disk. |
 | `--new-code` or a different `--code` | Old clients fail the MAC until they are told the new code. |
 | Different machine reuses a stale host id | Not possible unless someone copies the state file. The host id is the pin. |
-| Client restart | `pairflow join` with no argument reuses the saved peer code and prefers the pinned host id. |
+| Client restart | The tray app, or `pairflow join` with no argument, reuses the saved peer code and prefers the pinned host id. `last_role` of `host` resumes hosting instead. |
 
 There is no long-lived reconnect token in the ciphertext. Re-authentication is
 a full handshake, which is cheap and does not depend on the old socket. Backoff
@@ -335,11 +362,15 @@ The peers still run the same end-to-end handshake.
 
 GitHub Actions (`.github/workflows/ci.yml`):
 
-- `ubuntu-22.04` runs `cargo test` and builds the AppImage. 22.04 keeps the
-  glibc requirement modest. The binary does not link libX11.
-- `windows-latest` tests and uploads `pairflow-windows-x86_64.exe`.
-- `macos-latest` tests, builds a universal binary, and uploads
-  `pairflow-macos.dmg`.
+- `ubuntu-22.04` installs the tray libraries (`libdbus-1-dev`, `libx11-dev`,
+  `libxkbcommon-dev`, `libgl1-mesa-dev`, `libegl1-mesa-dev`, `libxcb1-dev`),
+  runs `cargo test`, and builds the AppImage. 22.04 keeps the glibc
+  requirement modest. Capture still uses `x11rb`. The tray app links the
+  desktop libraries named above.
+- `windows-latest` tests, embeds the DPI manifest into both executables, and
+  uploads `pairflow-windows-x86_64.exe` (tray) plus `pairflow-cli.exe`.
+- `macos-latest` tests, builds universal binaries, and uploads
+  `pairflow-macos.dmg`. The bundle executable is `pairflow-gui`.
 - A tag `v*` publishes a **draft** GitHub Release with those three files.
   Untagged pushes and pull requests upload the same files as workflow
   artifacts only.
@@ -351,7 +382,7 @@ and notarization for macOS, and Authenticode for Windows.
 
 1. Wayland via the XDG input-capture portal or libei, with X11 kept as a fallback.
 2. Optional longer codes and SPAKE2, then the relay above.
-3. Multi-monitor geometry and a second peer.
+3. A second peer, and choosing which host monitor borders it. The guest
+   already uses the union of its displays.
 4. Clipboard.
-5. A small status window on all three platforms, still driving this core.
-6. Signed, notarized releases.
+5. Signed, notarized releases.

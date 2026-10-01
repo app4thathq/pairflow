@@ -1,29 +1,40 @@
 #!/usr/bin/env bash
-# Build a Pairflow AppImage from target/release/pairflow.
+# Build a Pairflow AppImage from the release binaries.
 # Run on Linux after `cargo build --release`. FUSE is not required.
+# No arguments launches the tray app. Any arguments run the CLI
+# (`pairflow host`, `pairflow join CODE`, and so on).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BIN="${1:-$ROOT/target/release/pairflow}"
+GUI="${1:-$ROOT/target/release/pairflow-gui}"
+CLI="${2:-$ROOT/target/release/pairflow}"
 APPDIR="$ROOT/packaging/linux/AppDir"
 DIST="$ROOT/dist"
 TOOL_DIR="${TMPDIR:-/tmp}/pairflow-appimagetool"
 
-if [[ ! -x "$BIN" ]]; then
-  echo "missing release binary at $BIN" >&2
+if [[ ! -x "$GUI" ]]; then
+  echo "missing tray binary at $GUI" >&2
+  exit 1
+fi
+if [[ ! -x "$CLI" ]]; then
+  echo "missing CLI binary at $CLI" >&2
   exit 1
 fi
 
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$DIST"
-cp "$BIN" "$APPDIR/usr/bin/pairflow"
-chmod +x "$APPDIR/usr/bin/pairflow"
+cp "$GUI" "$APPDIR/usr/bin/pairflow-gui"
+cp "$CLI" "$APPDIR/usr/bin/pairflow"
+chmod +x "$APPDIR/usr/bin/pairflow-gui" "$APPDIR/usr/bin/pairflow"
 cp "$ROOT/packaging/linux/pairflow.desktop" "$APPDIR/pairflow.desktop"
 cp "$ROOT/packaging/linux/pairflow.png" "$APPDIR/pairflow.png"
 
 cat > "$APPDIR/AppRun" << 'EOF'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
+if [ "$#" -eq 0 ]; then
+  exec "$HERE/usr/bin/pairflow-gui"
+fi
 exec "$HERE/usr/bin/pairflow" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"

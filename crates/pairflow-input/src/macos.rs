@@ -4,7 +4,7 @@
 //! from System Settings → Privacy & Security → Accessibility. Input Monitoring
 //! may also be required on newer macOS releases.
 
-use super::{Input, InputError, Platform};
+use super::{add_motion, Input, InputError, Platform};
 use core_foundation::runloop::{kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop};
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
@@ -13,6 +13,7 @@ use core_graphics::event::{
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use pairflow_core::union_desktop;
 use pairflow_proto::{InputEvent, KeyId, MouseButton};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
@@ -38,10 +39,43 @@ const CONTROL: u64 = 0x0004_0000;
 const ALTERNATE: u64 = 0x0008_0000;
 const COMMAND: u64 = 0x0010_0000;
 
+/// Union of every active display in Quartz global points.
+///
+/// `CGDisplay::pixels_wide` is the framebuffer size. Mouse warps and event
+/// locations use points (`bounds`), and a display to the left of the main
+/// panel has a negative origin. Measuring only the main display in pixels
+/// confined the guest cursor to a box on one screen.
+fn desktop_points() -> (i32, i32, i32, i32) {
+    let mut rects = Vec::new();
+    if let Ok(ids) = CGDisplay::active_displays() {
+        for id in ids {
+            let bounds = CGDisplay::new(id).bounds();
+            let w = bounds.size.width.round() as i32;
+            let h = bounds.size.height.round() as i32;
+            if w > 0 && h > 0 {
+                rects.push((
+                    bounds.origin.x.round() as i32,
+                    bounds.origin.y.round() as i32,
+                    w,
+                    h,
+                ));
+            }
+        }
+    }
+    if let Some(desktop) = union_desktop(&rects) {
+        return desktop;
+    }
+    let bounds = CGDisplay::main().bounds();
+    (
+        bounds.origin.x.round() as i32,
+        bounds.origin.y.round() as i32,
+        (bounds.size.width.round() as i32).max(2),
+        (bounds.size.height.round() as i32).max(2),
+    )
+}
+
 pub fn open() -> Result<Input, InputError> {
-    let display = CGDisplay::main();
-    let width = display.pixels_wide().max(2) as i32;
-    let height = display.pixels_high().max(2) as i32;
+    let (origin_x, origin_y, width, height) = desktop_points();
     let (event_tx, event_rx) = sync_channel(1024);
     {
         TX.lock().unwrap().tx = Some(event_tx.clone());
@@ -59,8 +93,8 @@ pub fn open() -> Result<Input, InputError> {
         }
     }
     Ok(Input::from_channel(
-        0,
-        0,
+        origin_x,
+        origin_y,
         width,
         height,
         event_tx,
@@ -182,7 +216,7 @@ fn on_event(ty: CGEventType, event: &CGEvent) -> CallbackResult {
                 let dx = x - ANCHOR_X.load(Ordering::Relaxed);
                 let dy = y - ANCHOR_Y.load(Ordering::Relaxed);
                 if dx != 0 || dy != 0 {
-                    emit(InputEvent::MouseMove { dx, dy });
+                    add_motion(dx, dy);
                     let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(
                         ANCHOR_X.load(Ordering::Relaxed) as f64,
                         ANCHOR_Y.load(Ordering::Relaxed) as f64,

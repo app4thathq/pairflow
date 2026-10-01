@@ -31,6 +31,8 @@ pub struct Identity {
     pub code: String,
     pub peer_code: Option<String>,
     pub peer_host_id: Option<[u8; 16]>,
+    last_role: Option<String>,
+    pointer_scale: Option<f32>,
     path: PathBuf,
 }
 
@@ -41,6 +43,10 @@ struct FileShape {
     #[serde(default)]
     peer_code: Option<String>,
     peer_host_id_hex: Option<String>,
+    #[serde(default)]
+    last_role: Option<String>,
+    #[serde(default)]
+    pointer_scale: Option<f32>,
 }
 
 impl Identity {
@@ -59,6 +65,8 @@ impl Identity {
             code: None,
             peer_code: None,
             peer_host_id_hex: None,
+            last_role: None,
+            pointer_scale: None,
         });
         let host_id = parse_hex16(&shape.host_id_hex).unwrap_or_else(|_| random_id());
         let code = if let Some(code) = explicit_code {
@@ -83,12 +91,21 @@ impl Identity {
         shape.code = Some(code.clone());
         shape.peer_code = peer_code.clone();
         shape.peer_host_id_hex = peer_host_id.map(|id| hex_encode(&id));
+        let last_role = shape
+            .last_role
+            .clone()
+            .filter(|role| role == "host" || role == "join");
+        let pointer_scale = shape.pointer_scale.filter(|s| s.is_finite() && *s > 0.0);
+        shape.last_role = last_role.clone();
+        shape.pointer_scale = pointer_scale;
         write_shape(path, &shape)?;
         Ok(Self {
             host_id,
             code,
             peer_code,
             peer_host_id,
+            last_role,
+            pointer_scale,
             path: path.to_path_buf(),
         })
     }
@@ -103,15 +120,62 @@ impl Identity {
         self.flush()
     }
 
+    pub fn last_role(&self) -> Option<&str> {
+        self.last_role.as_deref()
+    }
+
+    /// `host` or `join`. Anything else is ignored.
+    pub fn remember_role(&mut self, role: &str) -> Result<(), StateError> {
+        if role == "host" || role == "join" {
+            self.last_role = Some(role.to_string());
+            self.flush()
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn pointer_scale(&self) -> f32 {
+        self.pointer_scale.unwrap_or(1.0).clamp(0.1, 8.0)
+    }
+
+    pub fn remember_pointer_scale(&mut self, scale: f32) -> Result<(), StateError> {
+        if scale.is_finite() && (0.1..=8.0).contains(&scale) {
+            self.pointer_scale = Some(scale);
+            self.flush()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Tray launch: resume hosting, otherwise reconnect to the saved peer.
+    pub fn launch_action(&self) -> LaunchAction {
+        if self.last_role.as_deref() == Some("host") {
+            LaunchAction::Host
+        } else if let Some(code) = self.peer_code.clone() {
+            LaunchAction::Join(code)
+        } else {
+            LaunchAction::Idle
+        }
+    }
+
     fn flush(&self) -> Result<(), StateError> {
         let shape = FileShape {
             host_id_hex: hex_encode(&self.host_id),
             code: Some(self.code.clone()),
             peer_code: self.peer_code.clone(),
             peer_host_id_hex: self.peer_host_id.map(|id| hex_encode(&id)),
+            last_role: self.last_role.clone(),
+            pointer_scale: self.pointer_scale,
         };
         write_shape(&self.path, &shape)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchAction {
+    Host,
+    Join(String),
+    Idle,
 }
 
 fn default_path() -> PathBuf {
@@ -195,5 +259,28 @@ mod tests {
         assert_eq!(first.host_id, third.host_id);
         assert_ne!(first.code, third.code);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remembers_peer_and_reloads_the_join_role() {
+        let dir = std::env::temp_dir().join(format!("pairflow-role-{}", std::process::id()));
+        let path = dir.join("state.json");
+        let _ = fs::remove_dir_all(&dir);
+        let mut id = Identity::load_at(&path, true, None).unwrap();
+        id.remember_peer_code("K7NQ2").unwrap();
+        id.remember_role("join").unwrap();
+        id.remember_pointer_scale(1.25).unwrap();
+        let again = Identity::load_at(&path, false, None).unwrap();
+        assert_eq!(again.launch_action(), LaunchAction::Join("K7NQ2".into()));
+        assert!((again.pointer_scale() - 1.25).abs() < f32::EPSILON);
+        again_role_host(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn again_role_host(path: &Path) {
+        let mut id = Identity::load_at(path, false, None).unwrap();
+        id.remember_role("host").unwrap();
+        let again = Identity::load_at(path, false, None).unwrap();
+        assert_eq!(again.launch_action(), LaunchAction::Host);
     }
 }
