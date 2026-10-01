@@ -3,7 +3,7 @@
 //! Wayland compositors do not allow this kind of global grab. Pairflow needs
 //! an X11 session, or XWayland with `DISPLAY` set (grabs are best-effort there).
 
-use super::{Input, InputError, Platform};
+use super::{add_motion, Input, InputError, Platform};
 use pairflow_proto::{InputEvent, KeyId, MouseButton};
 use std::collections::HashSet;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
@@ -295,7 +295,7 @@ fn handle_event(
             let dx = ev.root_x as i32 - state.anchor_x as i32;
             let dy = ev.root_y as i32 - state.anchor_y as i32;
             if dx != 0 || dy != 0 {
-                push(events, InputEvent::MouseMove { dx, dy });
+                add_motion(dx, dy);
                 let _ = warp(conn, root, state.anchor_x as i32, state.anchor_y as i32);
             }
         }
@@ -337,7 +337,7 @@ fn handle_event(
                 axis_delta(&ev.valuator_mask, &ev.axisvalues_raw, 1),
             ) {
                 if dx != 0 || dy != 0 {
-                    push(events, InputEvent::MouseMove { dx, dy });
+                    add_motion(dx, dy);
                     let _ = warp(
                         conn,
                         root,

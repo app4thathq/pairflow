@@ -196,6 +196,8 @@ impl HostShare {
 
 pub struct ClientShare {
     pub screen: Screen,
+    /// Multiplier on host cursor deltas. `1.0` keeps the host's travel.
+    pub sensitivity: f32,
     cursor: Option<RemoteCursor>,
 }
 
@@ -203,8 +205,17 @@ impl ClientShare {
     pub fn new(screen: Screen) -> Self {
         Self {
             screen,
+            sensitivity: 1.0,
             cursor: None,
         }
+    }
+
+    pub fn set_sensitivity(&mut self, sensitivity: f32) {
+        self.sensitivity = if sensitivity.is_finite() {
+            sensitivity.clamp(0.1, 8.0)
+        } else {
+            1.0
+        };
     }
 
     pub fn active(&self) -> bool {
@@ -230,13 +241,18 @@ impl ClientShare {
                 let Some(cursor) = self.cursor.as_mut() else {
                     return Vec::new();
                 };
+                let dx = scale_delta(dx, self.sensitivity);
+                let dy = scale_delta(dy, self.sensitivity);
                 let (ix, iy, leave) = cursor.apply(dx, dy);
                 let mut out = Vec::new();
+                // Absolute placement, not a relative nudge. Relative injection
+                // is clamped by the OS to the display under the cursor, which
+                // trapped the pointer on one monitor and discarded the rest.
                 if ix != 0 || iy != 0 {
-                    out.push(ClientEffect::Inject(InputEvent::MouseMove {
-                        dx: ix,
-                        dy: iy,
-                    }));
+                    out.push(ClientEffect::Warp {
+                        x: cursor.x,
+                        y: cursor.y,
+                    });
                 }
                 if let Some(frac) = leave {
                     let edge = cursor.return_edge();
@@ -261,6 +277,13 @@ impl ClientShare {
             Vec::new()
         }
     }
+}
+
+fn scale_delta(v: i32, sensitivity: f32) -> i32 {
+    if !sensitivity.is_finite() || (sensitivity - 1.0).abs() < f32::EPSILON {
+        return v;
+    }
+    (v as f32 * sensitivity).round() as i32
 }
 
 #[cfg(test)]
@@ -425,5 +448,41 @@ mod tests {
             down: true,
         });
         assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn guest_pointer_reaches_the_mac_past_the_external_display() {
+        // [external 2560x1440 at x=-2560] [Mac 1512x982]. Union covers both.
+        let screen = Screen::with_origin(-2560, 0, 2560 + 1512, 1440);
+        let mut client = ClientShare::new(screen);
+        client.on_msg(SecureMsg::Enter {
+            edge: Side::Left,
+            frac: 4_000,
+        });
+        assert!(client.active());
+        let on_external = client.on_msg(SecureMsg::MouseMove { dx: 2500, dy: 0 });
+        assert!(on_external.iter().any(|e| matches!(
+            e,
+            ClientEffect::Warp { x, .. } if (-80..0).contains(x)
+        )));
+        let on_mac = client.on_msg(SecureMsg::MouseMove { dx: 900, dy: 0 });
+        let x = on_mac.iter().find_map(|e| match e {
+            ClientEffect::Warp { x, .. } => Some(*x),
+            _ => None,
+        });
+        assert!(x.is_some_and(|x| x > 0 && x < 1512));
+        assert!(client.active());
+        let mut left = false;
+        for _ in 0..20 {
+            let fx = client.on_msg(SecureMsg::MouseMove { dx: -400, dy: 0 });
+            if fx
+                .iter()
+                .any(|e| matches!(e, ClientEffect::Send(SecureMsg::Leave { .. })))
+            {
+                left = true;
+                break;
+            }
+        }
+        assert!(left);
     }
 }

@@ -16,6 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install GUI libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev libx11-dev libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev libxcb1-dev
       - name: Run tests
         run: cargo test --workspace --locked
 
@@ -26,7 +30,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build release binary
+      - name: Install GUI libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev libx11-dev libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev libxcb1-dev
+      - name: Build release binaries
         run: cargo build --release --locked
       - name: Package AppImage
         run: packaging/linux/build-appimage.sh
@@ -49,15 +57,18 @@ jobs:
       - name: Embed per-monitor DPI manifest
         shell: pwsh
         run: packaging/windows/embed-manifest.ps1
-      - name: Stage portable executable
+      - name: Stage portable executables
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/pairflow.exe dist/pairflow-windows-x86_64.exe
+          Copy-Item target/release/pairflow-gui.exe dist/pairflow-windows-x86_64.exe
+          Copy-Item target/release/pairflow.exe dist/pairflow-cli.exe
       - uses: actions/upload-artifact@v4
         with:
           name: pairflow-windows-x86_64
-          path: dist/pairflow-windows-x86_64.exe
+          path: |
+            dist/pairflow-windows-x86_64.exe
+            dist/pairflow-cli.exe
           if-no-files-found: error
 
   macos:
@@ -74,11 +85,14 @@ jobs:
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
           mkdir -p dist
+          lipo -create -output dist/pairflow-gui \
+            target/aarch64-apple-darwin/release/pairflow-gui \
+            target/x86_64-apple-darwin/release/pairflow-gui
           lipo -create -output dist/pairflow \
             target/aarch64-apple-darwin/release/pairflow \
             target/x86_64-apple-darwin/release/pairflow
       - name: Package disk image
-        run: packaging/macos/build-dmg.sh dist/pairflow
+        run: packaging/macos/build-dmg.sh dist/pairflow-gui dist/pairflow
       - uses: actions/upload-artifact@v4
         with:
           name: pairflow-macos
