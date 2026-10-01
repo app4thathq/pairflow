@@ -8,7 +8,7 @@
 //! permission, and so on) callers can use [`Input::dry_run`], which only
 //! forwards events pushed with [`Input::emit`].
 
-use pairflow_proto::InputEvent;
+use pairflow_proto::{InputEvent, Side};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::time::Duration;
 
@@ -35,6 +35,8 @@ pub(crate) trait Platform: Send {
     fn take_pointer(&self) -> Option<InputEvent> {
         None
     }
+    /// Which desktop edge faces the peer. Windows uses this to claim that edge.
+    fn set_stick_side(&self, _side: Side) {}
 }
 
 pub struct Input {
@@ -42,6 +44,10 @@ pub struct Input {
     pub origin_y: i32,
     pub width: i32,
     pub height: i32,
+    /// False when capture could not be opened and events come only from stdin.
+    pub live: bool,
+    /// Short label for the startup banner (`Windows hooks active`, `DRY-RUN`, ...).
+    pub backend: &'static str,
     event_tx: SyncSender<InputEvent>,
     event_rx: Receiver<InputEvent>,
     ops: Box<dyn Platform>,
@@ -65,7 +71,9 @@ impl Input {
                 Ok(input) => return input,
                 Err(err) => eprintln!("pairflow: {err}"),
             }
-            eprintln!("pairflow: using dry-run input. Type `help` for stdin controls.");
+            eprintln!(
+                "pairflow: INPUT CAPTURE FAILED. Real mouse and keyboard will not be shared."
+            );
         }
         Self::dry_run()
     }
@@ -77,6 +85,8 @@ impl Input {
             origin_y: 0,
             width: 1920,
             height: 1080,
+            live: false,
+            backend: "DRY-RUN (stdin only, real mouse ignored)",
             event_tx,
             event_rx,
             ops: Box::new(NullPlatform),
@@ -97,6 +107,8 @@ impl Input {
             origin_y,
             width,
             height,
+            live: true,
+            backend: backend_name(),
             event_tx,
             event_rx,
             ops,
@@ -115,10 +127,11 @@ impl Input {
     }
 
     pub fn try_recv(&self) -> Option<InputEvent> {
-        if let Ok(ev) = self.event_rx.try_recv() {
+        // Pointer samples must not wait behind a burst of key events.
+        if let Some(ev) = self.ops.take_pointer() {
             return Some(ev);
         }
-        self.ops.take_pointer()
+        self.event_rx.try_recv().ok()
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Option<InputEvent> {
@@ -139,11 +152,35 @@ impl Input {
     pub fn set_exclusive(&self, on: bool) {
         self.ops.set_exclusive(on);
     }
+
+    /// Tell the capture backend which edge the peer sits on.
+    pub fn set_stick_side(&self, side: Side) {
+        self.ops.set_stick_side(side);
+    }
 }
 
 impl Drop for Input {
     fn drop(&mut self) {
         self.ops.shutdown();
+    }
+}
+
+fn backend_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Windows hooks active"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "Quartz event tap active"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "X11 capture active"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        "capture active"
     }
 }
 

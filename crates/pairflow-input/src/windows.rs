@@ -3,23 +3,33 @@
 //! Low-level hooks do not need an administrator account. They do not see input
 //! on the secure desktop (UAC prompts, the lock screen).
 //!
-//! Cursor coordinates and the desktop rectangle are both read after enabling
-//! per-monitor DPI awareness, so they stay in physical pixels. The desktop is
-//! the virtual screen (every monitor). The latest cursor position is stored
-//! in atomics, so a burst of events cannot drop the sample that sits on the
-//! outer edge.
+//! The desktop rectangle and `GetCursorPos` are read on this hook thread after
+//! `SetThreadDpiAwarenessContext`, so they share one coordinate space. The
+//! shipped exe also embeds a per-monitor v2 manifest because a console process
+//! often cannot change awareness later. Local pointer samples come only from
+//! the 8 ms poll. The hook's `pt` is always physical and, on a DPI-unaware
+//! process, used to overwrite the sample that the edge test reads. Near the
+//! peer's outer edge the poll publishes a point on that desktop edge and
+//! `ClipCursor`s the monitor so the cursor cannot slide past it. If the hooks
+//! themselves never fire, the same poll still reports position and, once the
+//! pointer is remote, relative motion.
 
 use super::{Input, InputError, Platform};
-use pairflow_proto::{InputEvent, KeyId, MouseButton};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use pairflow_proto::{InputEvent, KeyId, MouseButton, Side};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTONULL,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
@@ -29,10 +39,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetCursorPos, GetSystemMetrics, PeekMessageW, PostThreadMessageW, SetCursorPos,
-    SetProcessDPIAware, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG,
-    MSLLHOOKSTRUCT, PM_REMOVE, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    CallNextHookEx, ClipCursor, GetCursorPos, GetSystemMetrics, PeekMessageW, PostThreadMessageW,
+    SetCursorPos, SetProcessDPIAware, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
+    KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PM_REMOVE, SM_CXSCREEN, SM_CXVIRTUALSCREEN,
+    SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL,
+    WH_MOUSE_LL,
 };
 
 const WM_QUIT: u32 = 0x0012;
@@ -71,25 +82,36 @@ static CUR_X: AtomicI32 = AtomicI32::new(0);
 static CUR_Y: AtomicI32 = AtomicI32::new(0);
 /// 0 means no sample yet. Each new cursor position increments this.
 static CUR_SEQ: AtomicU64 = AtomicU64::new(0);
+static DESK_X: AtomicI32 = AtomicI32::new(0);
+static DESK_Y: AtomicI32 = AtomicI32::new(0);
+static DESK_W: AtomicI32 = AtomicI32::new(0);
+static DESK_H: AtomicI32 = AtomicI32::new(0);
+static CLIPPED: AtomicBool = AtomicBool::new(false);
+/// `Side` as u8. Default matches `pairflow host` (`right`).
+static STICK_SIDE: AtomicU8 = AtomicU8::new(Side::Right as u8);
+/// Incremented on each exclusive-mode hook delta so the poll does not double-send it.
+static HOOK_MOVE_SEQ: AtomicU64 = AtomicU64::new(0);
+static SEEN_HOOK_SEQ: AtomicU64 = AtomicU64::new(0);
+/// How close to the peer's outer monitor edge we claim the pointer, in pixels.
+const STICK_PX: i32 = 32;
 
 pub fn open() -> Result<Input, InputError> {
     enable_dpi_awareness();
-    let (origin_x, origin_y, width, height) = virtual_desktop();
     let (event_tx, event_rx) = sync_channel(1024);
     let thread_tx = event_tx.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let join = thread::spawn(move || hook_thread(thread_tx, ready_tx));
-    if ready_rx
-        .recv_timeout(std::time::Duration::from_secs(3))
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return Err(InputError::Message(
-            "Windows input hooks did not start".into(),
-        ));
-    }
-    Ok(Input::from_channel(
+    let ((origin_x, origin_y, width, height), hooks_ok) =
+        match ready_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(Ok(started)) => started,
+            Ok(Err(err)) => return Err(InputError::Message(err)),
+            Err(_) => {
+                return Err(InputError::Message(
+                    "Windows input hooks did not start".into(),
+                ))
+            }
+        };
+    let mut input = Input::from_channel(
         origin_x,
         origin_y,
         width,
@@ -100,7 +122,11 @@ pub fn open() -> Result<Input, InputError> {
             join: std::sync::Mutex::new(Some(join)),
             last_seq: AtomicU64::new(0),
         }),
-    ))
+    );
+    if !hooks_ok {
+        input.backend = "Windows cursor poll only (low-level hooks failed)";
+    }
+    Ok(input)
 }
 
 fn enable_dpi_awareness() {
@@ -152,9 +178,14 @@ impl Platform for WinOps {
         }
         IN_WARP.store(false, Ordering::Relaxed);
     }
+    fn set_stick_side(&self, side: Side) {
+        STICK_SIDE.store(side as u8, Ordering::Relaxed);
+    }
+
     fn set_exclusive(&self, on: bool) {
         if on {
-            let mut pt = windows::Win32::Foundation::POINT::default();
+            release_clip();
+            let mut pt = POINT::default();
             unsafe {
                 if GetCursorPos(&mut pt).is_ok() {
                     ANCHOR_X.store(pt.x, Ordering::Relaxed);
@@ -165,6 +196,7 @@ impl Platform for WinOps {
         EXCLUSIVE.store(on, Ordering::Relaxed);
     }
     fn shutdown(&self) {
+        release_clip();
         let tid = HOOK.lock().unwrap().thread_id;
         if tid != 0 {
             unsafe {
@@ -192,28 +224,51 @@ impl Platform for WinOps {
     }
 }
 
-fn hook_thread(tx: SyncSender<InputEvent>, ready: std::sync::mpsc::Sender<Option<String>>) {
+fn hook_thread(
+    tx: SyncSender<InputEvent>,
+    ready: std::sync::mpsc::Sender<Result<((i32, i32, i32, i32), bool), String>>,
+) {
+    // This thread both samples the cursor and measures the desktop. Doing both
+    // here, after setting this thread's DPI context, keeps them in one space.
+    // The main thread's metrics can disagree if its awareness differs.
+    unsafe {
+        let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // Low-level hooks are posted to this thread. The queue must exist first.
+        let mut warmup = MSG::default();
+        let _ = PeekMessageW(&mut warmup, None, 0, 0, PM_NOREMOVE);
+    }
+    let (origin_x, origin_y, width, height) = virtual_desktop();
+    DESK_X.store(origin_x, Ordering::Relaxed);
+    DESK_Y.store(origin_y, Ordering::Relaxed);
+    DESK_W.store(width, Ordering::Relaxed);
+    DESK_H.store(height, Ordering::Relaxed);
     let installed = unsafe { install() };
     let (mouse, key) = match installed {
-        Ok(hooks) => hooks,
+        Ok((mouse, key)) => (Some(mouse), Some(key)),
         Err(err) => {
-            let _ = ready.send(Some(err));
-            return;
+            eprintln!("pairflow: low-level hooks failed: {err}");
+            eprintln!("pairflow: cursor poll is still running; keyboard capture needs the hooks.");
+            (None, None)
         }
     };
+    let hooks_ok = mouse.is_some();
     {
         let mut guard = HOOK.lock().unwrap();
         guard.tx = Some(tx);
         guard.thread_id = unsafe { GetCurrentThreadId() };
     }
-    let _ = ready.send(None);
+    let _ = ready.send(Ok(((origin_x, origin_y, width, height), hooks_ok)));
     unsafe {
         loop {
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
-                    let _ = UnhookWindowsHookEx(mouse);
-                    let _ = UnhookWindowsHookEx(key);
+                    if let Some(mouse) = mouse {
+                        let _ = UnhookWindowsHookEx(mouse);
+                    }
+                    if let Some(key) = key {
+                        let _ = UnhookWindowsHookEx(key);
+                    }
                     HOOK.lock().unwrap().tx = None;
                     return;
                 }
@@ -227,16 +282,127 @@ fn hook_thread(tx: SyncSender<InputEvent>, ready: std::sync::mpsc::Sender<Option
 }
 
 fn sample_cursor() {
-    if EXCLUSIVE.load(Ordering::Relaxed) || IN_WARP.load(Ordering::Relaxed) {
+    if IN_WARP.load(Ordering::Relaxed) {
         return;
     }
-    let mut pt = windows::Win32::Foundation::POINT::default();
+    if EXCLUSIVE.load(Ordering::Relaxed) {
+        release_clip();
+        // The hook forwards motion when it fires. If it never fires (security
+        // software), the cursor still moves and this poll is the only delta.
+        let seq = HOOK_MOVE_SEQ.load(Ordering::Acquire);
+        let seen = SEEN_HOOK_SEQ.swap(seq, Ordering::AcqRel);
+        if seen != seq {
+            return;
+        }
+        let mut pt = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut pt).is_err() {
+                return;
+            }
+        }
+        let ax = ANCHOR_X.load(Ordering::Relaxed);
+        let ay = ANCHOR_Y.load(Ordering::Relaxed);
+        let dx = pt.x - ax;
+        let dy = pt.y - ay;
+        if dx != 0 || dy != 0 {
+            emit(InputEvent::MouseMove { dx, dy });
+            IN_WARP.store(true, Ordering::Relaxed);
+            unsafe {
+                let _ = SetCursorPos(ax, ay);
+            }
+            IN_WARP.store(false, Ordering::Relaxed);
+        }
+        return;
+    }
+    let mut pt = POINT::default();
     unsafe {
         if GetCursorPos(&mut pt).is_err() {
             return;
         }
     }
-    publish_cursor(pt.x, pt.y);
+    let (x, y) = stick_outer_edge(pt.x, pt.y);
+    publish_cursor(x, y);
+}
+
+/// If the cursor is within [`STICK_PX`] of the peer's outer monitor edge, publish
+/// a point on the desktop edge HostShare tests and pin the cursor to that monitor
+/// so Windows cannot slide it past the pixel we are watching.
+fn stick_outer_edge(x: i32, y: i32) -> (i32, i32) {
+    let desk_left = DESK_X.load(Ordering::Relaxed);
+    let desk_top = DESK_Y.load(Ordering::Relaxed);
+    let desk_right = desk_left.saturating_add(DESK_W.load(Ordering::Relaxed));
+    let desk_bottom = desk_top.saturating_add(DESK_H.load(Ordering::Relaxed));
+    let Some(mon) = monitor_rect(x, y) else {
+        release_clip();
+        return (x, y);
+    };
+    let mut ox = x;
+    let mut oy = y;
+    let stick = match stick_side() {
+        Side::Right
+            if x >= mon.right - STICK_PX && monitor_missing(mon.right.saturating_add(2), y) =>
+        {
+            ox = desk_right - 1;
+            true
+        }
+        Side::Left if x < mon.left + STICK_PX && monitor_missing(mon.left.saturating_sub(2), y) => {
+            ox = desk_left;
+            true
+        }
+        Side::Bottom
+            if y >= mon.bottom - STICK_PX && monitor_missing(x, mon.bottom.saturating_add(2)) =>
+        {
+            oy = desk_bottom - 1;
+            true
+        }
+        Side::Top if y < mon.top + STICK_PX && monitor_missing(x, mon.top.saturating_sub(2)) => {
+            oy = desk_top;
+            true
+        }
+        _ => false,
+    };
+    if stick {
+        unsafe {
+            let _ = ClipCursor(Some(&mon as *const RECT));
+        }
+        CLIPPED.store(true, Ordering::Relaxed);
+    } else {
+        release_clip();
+    }
+    (ox, oy)
+}
+
+fn stick_side() -> Side {
+    Side::from_u8(STICK_SIDE.load(Ordering::Relaxed)).unwrap_or(Side::Right)
+}
+
+fn monitor_rect(x: i32, y: i32) -> Option<RECT> {
+    let handle = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) };
+    if handle.is_invalid() {
+        return None;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
+    let ok = unsafe { GetMonitorInfoW(handle, &mut info) };
+    if !ok.as_bool() {
+        return None;
+    }
+    Some(info.rcMonitor)
+}
+
+fn monitor_missing(x: i32, y: i32) -> bool {
+    let handle: HMONITOR = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL) };
+    handle.is_invalid()
+}
+
+fn release_clip() {
+    if CLIPPED.swap(false, Ordering::Relaxed) {
+        unsafe {
+            let _ = ClipCursor(None);
+        }
+    }
 }
 
 fn publish_cursor(x: i32, y: i32) {
@@ -279,6 +445,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 let dy = info.pt.y - ay;
                 if dx != 0 || dy != 0 {
                     emit(InputEvent::MouseMove { dx, dy });
+                    HOOK_MOVE_SEQ.fetch_add(1, Ordering::Release);
                     IN_WARP.store(true, Ordering::Relaxed);
                     let _ = SetCursorPos(ax, ay);
                     IN_WARP.store(false, Ordering::Relaxed);
@@ -302,9 +469,9 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         }
         return LRESULT(1);
     }
-    if msg == WM_MOUSEMOVE {
-        publish_cursor(info.pt.x, info.pt.y);
-    }
+    // Local position is the poll's job. `info.pt` is always physical pixels.
+    // On a DPI-unaware process that disagrees with `GetSystemMetrics`, publishing
+    // it here overwrote the stuck edge sample and the edge test stayed false.
     CallNextHookEx(None, code, wparam, lparam)
 }
 

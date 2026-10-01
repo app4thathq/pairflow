@@ -58,6 +58,9 @@ enum Command {
         /// Skip UDP broadcast advertisement.
         #[arg(long)]
         no_udp: bool,
+        /// Log cursor coordinates and whether they are inside the edge margin.
+        #[arg(long)]
+        debug: bool,
     },
     /// Attach to a host that is showing `code`.
     Join {
@@ -130,6 +133,7 @@ fn dispatch(command: Command, running: &Arc<AtomicBool>) -> Result<(), String> {
             dry_run,
             no_mdns,
             no_udp,
+            debug,
         } => run_host(
             code.as_deref(),
             new_code,
@@ -138,6 +142,7 @@ fn dispatch(command: Command, running: &Arc<AtomicBool>) -> Result<(), String> {
             dry_run,
             !no_mdns,
             !no_udp,
+            debug,
             running,
         ),
         Command::Join {
@@ -258,6 +263,7 @@ fn default_host() -> Command {
         dry_run: false,
         no_mdns: false,
         no_udp: false,
+        debug: false,
     }
 }
 
@@ -294,12 +300,23 @@ fn run_host(
     dry_run: bool,
     mdns: bool,
     udp: bool,
+    debug: bool,
     running: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let side = Side::parse(side_name).ok_or_else(|| format!("unknown side '{side_name}'"))?;
     let identity = Identity::load(new_code, explicit).map_err(|e| e.to_string())?;
     let addr: SocketAddr = listen.parse().map_err(|e| format!("listen address: {e}"))?;
     let input = Input::open(dry_run);
+    input.set_stick_side(side);
+    if !dry_run && !input.live {
+        eprintln!();
+        eprintln!("  *** INPUT CAPTURE FAILED ***");
+        eprintln!("  Pairflow is not reading this computer's mouse.");
+        eprintln!("  Edge crossing cannot work. The error above is why.");
+        eprintln!("  --dry-run is only for tests that drive the pointer from stdin.");
+        eprintln!();
+        return Err("refusing to host without real input capture".into());
+    }
     let screen = Screen::with_origin(input.origin_x, input.origin_y, input.width, input.height);
     spawn_stdin(input.emitter(), screen, Some(side), running.clone());
     let listener = HostListener::bind(
@@ -321,7 +338,7 @@ fn run_host(
         mdns,
         udp,
     );
-    print_host_banner(&identity.code, side, bound.port(), screen);
+    print_host_banner(&identity.code, side, bound.port(), screen, &input);
     while running.load(Ordering::Relaxed) {
         let Some((session, peer)) = listener
             .accept_authenticated(running)
@@ -335,7 +352,7 @@ fn run_host(
             side.name()
         );
         let mut share = HostShare::new(screen, side);
-        if let Err(err) = host_session(session, &input, &mut share, running) {
+        if let Err(err) = host_session(session, &input, &mut share, debug, running) {
             eprintln!("pairflow: session ended: {err}");
         }
         input.set_exclusive(false);
@@ -371,6 +388,16 @@ fn run_join(
         return Err("pass a 5-character code, for example: pairflow join K7NQ2".into());
     };
     let input = Input::open(dry_run);
+    if !dry_run && !input.live {
+        eprintln!();
+        eprintln!("  *** INPUT CAPTURE FAILED ***");
+        eprintln!("  This computer will not inject the host's pointer.");
+        #[cfg(target_os = "macos")]
+        eprintln!("  Grant Accessibility (and Input Monitoring) to Pairflow, then try again.");
+        #[cfg(not(target_os = "macos"))]
+        eprintln!("  The error above is why. Fix capture, then try again.");
+        eprintln!();
+    }
     let screen = Screen::with_origin(input.origin_x, input.origin_y, input.width, input.height);
     spawn_stdin(input.emitter(), screen, None, running.clone());
     println!("joining with code {code}");
@@ -437,10 +464,13 @@ fn host_session(
     mut session: Session,
     input: &Input,
     share: &mut HostShare,
+    debug: bool,
     running: &AtomicBool,
 ) -> Result<(), String> {
     let mut last_hb = Instant::now();
     let mut last_rx = Instant::now();
+    let mut last_dbg = Instant::now() - Duration::from_secs(3);
+    let mut last_sample = None;
     while running.load(Ordering::Relaxed) {
         if last_hb.elapsed() >= Duration::from_secs(2) {
             session
@@ -455,6 +485,7 @@ fn host_session(
             }
             note_focus(was, share.remote);
         }
+        log_cursor(share, debug, &mut last_dbg, &mut last_sample);
         match session
             .recv_timeout(Duration::from_millis(20))
             .map_err(|e| e.to_string())?
@@ -481,6 +512,39 @@ fn host_session(
     }
     let _ = session.send(&SecureMsg::Bye);
     Ok(())
+}
+
+fn log_cursor(
+    share: &HostShare,
+    debug: bool,
+    last_dbg: &mut Instant,
+    last_sample: &mut Option<(i32, i32, bool)>,
+) {
+    let sample = share.cursor_debug();
+    if share.remote && !debug {
+        return;
+    }
+    let changed = debug && sample != *last_sample;
+    let due = last_dbg.elapsed() >= Duration::from_secs(2);
+    if !changed && !due {
+        return;
+    }
+    match sample {
+        Some((x, y, hit)) => {
+            println!(
+                "cursor {x},{y} edge={hit} remote={} (Ctrl+Alt+Enter forces cross, Ctrl+Alt+F12 returns)",
+                share.remote
+            );
+        }
+        None => {
+            println!(
+                "cursor (no sample yet) edge=false remote={} — mouse position is not arriving",
+                share.remote
+            );
+        }
+    }
+    *last_sample = sample;
+    *last_dbg = Instant::now();
 }
 
 fn apply_host(session: &mut Session, input: &Input, effect: HostEffect) -> Result<(), String> {
@@ -571,8 +635,10 @@ fn note_focus(was: bool, now: bool) {
     }
 }
 
-fn print_host_banner(code: &str, side: Side, port: u16, screen: Screen) {
+fn print_host_banner(code: &str, side: Side, port: u16, screen: Screen, input: &Input) {
     println!();
+    println!("  pairflow {}", env!("CARGO_PKG_VERSION"));
+    println!("  Input: {}", input.backend);
     println!("  Pairing code:  {code}");
     println!();
     println!("  On the other computer:  pairflow join {code}");
@@ -584,6 +650,8 @@ fn print_host_banner(code: &str, side: Side, port: u16, screen: Screen) {
         screen.y,
         side.name()
     );
+    println!("  Force cross: Ctrl+Alt+Enter or Ctrl+Alt+Right. Return: Ctrl+Alt+F12.");
+    println!("  Cursor coordinates print every 2s. --debug prints them as they change.");
     println!("  Listening on TCP {port} (UDP discovery {DEFAULT_UDP_PORT}).");
     println!("  Release hotkey: Ctrl+Alt+F12");
     println!("  Stdin: help, edge, pos X Y, move DX DY, key NAME down|up, quit");
@@ -755,6 +823,7 @@ mod tests {
                 dry_run,
                 no_mdns,
                 no_udp,
+                debug,
             } => {
                 assert!(code.is_none());
                 assert!(!new_code);
@@ -762,6 +831,7 @@ mod tests {
                 assert_eq!(listen, "0.0.0.0:24816");
                 assert!(!dry_run);
                 assert!(!no_mdns && !no_udp);
+                assert!(!debug);
             }
             Command::Join { .. } => panic!("host"),
         }

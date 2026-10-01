@@ -165,7 +165,7 @@ The host polls (or receives) the pointer in screen coordinates, y downward.
 The desktop rectangle is every attached monitor, not only the primary, and it
 may start at a negative origin. `--side right` means the peer is past the
 outer right edge of that rectangle (not the seam between two local monitors).
-When the pointer sits in the outer 2 pixels of that edge, or a relative move
+When the pointer sits in the outer 32 pixels of that edge, or a relative move
 from the last known position crosses it, the host:
 
 1. Tells the input backend to capture exclusively (grab or swallow).
@@ -179,9 +179,11 @@ only the part that stays on screen and sends `Leave` with the new fraction.
 The host drops the grab and warps its cursor 24 pixels inside the same edge.
 
 `Ctrl+Alt+F12` on the host forces the same return and releases modifiers on
-the client so they do not stick. Stdin accepts the same controls for dry-run
-and for machines where a grab is unavailable: `edge`, `pos`, `move`, `btn`,
-`key`, `quit`.
+the client so they do not stick. `Ctrl+Alt+Enter` and `Ctrl+Alt+Right` force
+the same enter path as an edge hit. Stdin accepts the same controls for
+dry-run and for machines where a grab is unavailable: `edge`, `pos`, `move`,
+`btn`, `key`, `quit`. A host whose real capture failed refuses to run.
+`--dry-run` is explicit.
 
 The client does not grab its own physical mouse in this MVP. That is acceptable
 because the person is touching the host's mouse. A second person at the client
@@ -216,19 +218,28 @@ A background thread installs `WH_MOUSE_LL` and `WH_KEYBOARD_LL` and pumps
 messages. Low-level hooks do **not** require an administrator account. They do
 not see input on the secure desktop (the lock screen, UAC prompts).
 
-- Before any metric or hook call, the process enables per-monitor DPI
-  awareness (falling back to system DPI awareness). `WH_MOUSE_LL` positions
-  are physical pixels; `GetSystemMetrics(SM_CXSCREEN)` on a DPI-unaware
-  process is not. v0.1.1 compared those two spaces, so a cursor pushed to the
-  right edge often never satisfied the edge test.
+- The executable embeds a per-monitor v2 application manifest
+  (`packaging/windows/pairflow.exe.manifest`) so awareness is set before any
+  code runs. A console process often cannot change it later. The hook thread
+  also calls `SetThreadDpiAwarenessContext` and only then reads the virtual
+  desktop, so the rectangle and `GetCursorPos` share one space. v0.1.1
+  compared hook positions (always physical) with unaware metrics. v0.1.2
+  measured the desktop on the main thread and still published those physical
+  hook points, which could overwrite a poll sample that would have hit.
 - The desktop comes from `SM_XVIRTUALSCREEN` / `SM_CXVIRTUALSCREEN` (and the
   Y pair), so a second monitor is inside the rectangle and the peer is the
   outer edge.
-- Local mode publishes the latest cursor position (hook and an 8 ms
-  `GetCursorPos` poll). The main thread reads that sample directly, so a full
-  event queue cannot drop the position that sits on the edge.
-- Remote mode swallows the event (the hook returns 1), forwards the delta from
-  an anchor, and `SetCursorPos`s back. A re-entry flag ignores the warp.
+- Local mode publishes the latest cursor from an 8 ms `GetCursorPos` poll
+  only. The main thread reads that sample before queued key events, so a full
+  event queue cannot drop the position that sits on the edge. Within 32
+  pixels of the peer's outer monitor edge the poll reports the desktop edge
+  and `ClipCursor` keeps the pointer on that monitor.
+- If `SetWindowsHookEx` fails, the poll still runs and the banner says the
+  hooks are not active. The host does not fall back to a quiet dry-run.
+- Remote mode swallows the event when the hook is alive (the hook returns 1),
+  forwards the delta from an anchor, and `SetCursorPos`s back. If the hook
+  never fires, the poll forwards that delta instead. A re-entry flag ignores
+  the warp.
 - Events with the injected flag are ignored so the client's own `SendInput`
   is not captured again.
 - Injection is `SendInput`: relative `MOUSEEVENTF_MOVE`, button flags, wheel
