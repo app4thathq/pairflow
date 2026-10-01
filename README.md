@@ -52,6 +52,11 @@ On the other computer:
 pairflow join K7NQ2
 ```
 
+Double-clicking the Windows `.exe` opens the same choices in the console and
+leaves the window open: `1` Host, `2` Join (type a code, or press Enter to
+reuse the last one), `q` Quit. `pairflow host` and `pairflow join CODE` from a
+terminal are unchanged.
+
 The peer is to the **right** of the host by default. Put it on another edge
 with `pairflow host --side left` (also `top` or `bottom`). Move the pointer
 through that edge. Keys follow the pointer. `Ctrl+Alt+F12` on the host returns
@@ -102,10 +107,13 @@ System Settings → Privacy & Security → Accessibility → enable Pairflow.
 The command-line binary inside the app is
 `Pairflow.app/Contents/MacOS/pairflow-cli`.
 
-**Windows.** The `.exe` does not need to run as administrator. Low-level hooks
-do not receive input on the secure desktop (the lock screen and UAC prompts).
-You may need to allow `pairflow.exe` through the firewall for private networks
-so TCP `24816` and UDP `24817` work.
+**Windows.** Double-click `pairflow-windows-x86_64.exe`. The console stays open
+and shows Host, Join, and Quit. Starting it with incomplete arguments prints
+the error and waits for Enter before the window closes, so Explorer does not
+hide the message. The `.exe` does not need to run as administrator. Low-level
+hooks do not receive input on the secure desktop (the lock screen and UAC
+prompts). You may need to allow `pairflow.exe` through the firewall for private
+networks so TCP `24816` and UDP `24817` work.
 
 **Linux.** An X11 session is required (`DISPLAY` must be set). Wayland is not
 supported yet; XWayland sometimes works, and grabs there are best-effort. The
