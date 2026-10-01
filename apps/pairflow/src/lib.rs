@@ -27,6 +27,18 @@ pub mod gui_app;
 pub mod update;
 pub use feedback::{set_sink, UiEvent};
 
+/// Clipboard text plus a copy at the per-user diagnostics path.
+pub fn diagnostics_text() -> (String, std::path::PathBuf) {
+    let path = pairflow_core::diagnostics_path();
+    let body = pairflow_core::diag_snapshot(env!("CARGO_PKG_VERSION"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, &body);
+    let text = format!("file: {}\n{body}", path.display());
+    (text, path)
+}
+
 #[derive(Parser)]
 #[command(
     name = "pairflow",
@@ -330,6 +342,8 @@ pub fn run_host(
         return Err("refusing to host without real input capture".into());
     }
     let screen = Screen::with_origin(input.origin_x, input.origin_y, input.width, input.height);
+    pairflow_core::diag_fact("role", "host");
+    pairflow_core::diag_fact("peer_side", format!("{side:?}"));
     spawn_stdin(input.emitter(), screen, Some(side), running.clone());
     let listener = HostListener::bind(
         addr,
@@ -437,6 +451,8 @@ pub fn run_join(
         )
     };
     println!("{desktop}");
+    pairflow_core::diag_fact("role", "guest");
+    pairflow_core::diag_note(&desktop);
     feedback::emit(UiEvent::Message(desktop));
     spawn_stdin(input.emitter(), screen, None, running.clone());
     println!("joining with code {code}");
@@ -616,7 +632,15 @@ fn client_session(
 ) -> Result<(), String> {
     let mut last_hb = Instant::now();
     let mut last_rx = Instant::now();
+    let mut last_sample = Instant::now();
     while running.load(Ordering::Relaxed) {
+        if share.active() && last_sample.elapsed() >= Duration::from_millis(500) {
+            last_sample = Instant::now();
+            if let Some((x, y)) = share.cursor_pos() {
+                let os = input.os_cursor();
+                pairflow_core::diag_note(format!("guest sample logical=({x},{y}) os={os:?}"));
+            }
+        }
         if last_hb.elapsed() >= Duration::from_secs(2) {
             session
                 .send(&SecureMsg::Heartbeat { unix_ms: unix_ms() })
@@ -666,6 +690,15 @@ fn apply_client(session: &mut Session, input: &Input, effect: ClientEffect) -> R
         }
         ClientEffect::Warp { x, y } => {
             input.warp(x, y);
+            if let Some((ox, oy)) = input.os_cursor() {
+                pairflow_core::diag_note(format!(
+                    "os cursor after warp ({ox},{oy}) requested ({x},{y})"
+                ));
+            }
+            Ok(())
+        }
+        ClientEffect::Synthetic(on) => {
+            input.set_synthetic_cursor(on);
             Ok(())
         }
     }

@@ -109,6 +109,65 @@ pub fn inset_point(screen: Screen, peer: Side, frac: u16, inset: i32) -> (i32, i
     }
 }
 
+/// One display in pointer coordinates. Origin may be negative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Where a global pointer point lands on a display, in that display's local
+/// coordinates (origin at the display's top-left).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayHit {
+    pub index: usize,
+    pub local_x: i32,
+    pub local_y: i32,
+    /// The point was outside every display and was moved onto the nearest one.
+    pub clamped: bool,
+}
+
+/// Pick the display that contains `(x, y)`. A point in the gap between
+/// displays (inside the bounding union, on no panel) maps to the nearest
+/// display instead of being left for the OS to pull onto the main panel.
+pub fn display_hit(displays: &[DisplayRect], x: i32, y: i32) -> Option<DisplayHit> {
+    let mut inside: Option<DisplayHit> = None;
+    let mut nearest: Option<(DisplayHit, i64)> = None;
+    for (index, display) in displays.iter().enumerate() {
+        if display.width <= 0 || display.height <= 0 {
+            continue;
+        }
+        let right = display.x.saturating_add(display.width);
+        let bottom = display.y.saturating_add(display.height);
+        if x >= display.x && x < right && y >= display.y && y < bottom {
+            inside = Some(DisplayHit {
+                index,
+                local_x: x.saturating_sub(display.x),
+                local_y: y.saturating_sub(display.y),
+                clamped: false,
+            });
+            break;
+        }
+        let cx = x.clamp(display.x, right - 1);
+        let cy = y.clamp(display.y, bottom - 1);
+        let dx = i64::from(x) - i64::from(cx);
+        let dy = i64::from(y) - i64::from(cy);
+        let dist = dx * dx + dy * dy;
+        let hit = DisplayHit {
+            index,
+            local_x: cx.saturating_sub(display.x),
+            local_y: cy.saturating_sub(display.y),
+            clamped: true,
+        };
+        if nearest.map(|(_, best)| dist < best).unwrap_or(true) {
+            nearest = Some((hit, dist));
+        }
+    }
+    inside.or_else(|| nearest.map(|(hit, _)| hit))
+}
+
 /// Cursor on the machine that is currently receiving the pointer.
 #[derive(Clone, Debug)]
 pub struct RemoteCursor {
@@ -229,6 +288,36 @@ mod tests {
         let shifted = Screen::with_origin(-1920, 0, 3840, 1080);
         assert!(hit_edge(shifted, -10, 10, Side::Right, 2).is_none());
         assert!(hit_edge(shifted, 1919, 10, Side::Right, 2).is_some());
+    }
+
+    #[test]
+    fn display_hit_reaches_the_built_in_panel_past_the_external() {
+        let displays = [
+            DisplayRect {
+                x: -3440,
+                y: 0,
+                width: 3440,
+                height: 1440,
+            },
+            DisplayRect {
+                x: 0,
+                y: 80,
+                width: 1512,
+                height: 982,
+            },
+        ];
+        let on_external = display_hit(&displays, -100, 200).unwrap();
+        assert_eq!(on_external.index, 0);
+        assert!(!on_external.clamped);
+        assert_eq!(on_external.local_x, 3340);
+        let on_panel = display_hit(&displays, 40, 200).unwrap();
+        assert_eq!(on_panel.index, 1);
+        assert_eq!((on_panel.local_x, on_panel.local_y), (40, 120));
+        assert!(!on_panel.clamped);
+        let gap = display_hit(&displays, 40, 70).unwrap();
+        assert_eq!(gap.index, 1);
+        assert!(gap.clamped);
+        assert_eq!(gap.local_y, 0);
     }
 
     #[test]

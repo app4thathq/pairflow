@@ -3,6 +3,7 @@
 //! The IO loops in the binary apply the effects. Keeping this free of sockets
 //! and OS input makes the edge-crossing rules testable.
 
+use crate::diag;
 use crate::gate::{hit_edge, inset_point, RemoteCursor, Screen};
 use pairflow_proto::{InputEvent, KeyId, SecureMsg, Side};
 use std::collections::BTreeSet;
@@ -22,7 +23,13 @@ pub enum HostEffect {
 pub enum ClientEffect {
     Send(SecureMsg),
     Inject(InputEvent),
-    Warp { x: i32, y: i32 },
+    Warp {
+        x: i32,
+        y: i32,
+    },
+    /// Guest is showing the remote pointer. The Mac backend dissociates the
+    /// hardware mouse for this interval so it cannot pull the cursor back.
+    Synthetic(bool),
 }
 
 pub struct HostShare {
@@ -160,6 +167,17 @@ impl HostShare {
     fn enter(&mut self, frac: u16) -> Vec<HostEffect> {
         self.remote = true;
         self.edge_latched = true;
+        diag::fact(
+            "host_screen",
+            format!(
+                "{}x{} at ({},{}) side={:?}",
+                self.screen.width, self.screen.height, self.screen.x, self.screen.y, self.peer_side
+            ),
+        );
+        diag::note(format!(
+            "host enter side={:?} frac={frac} screen {}x{} at ({},{})",
+            self.peer_side, self.screen.width, self.screen.height, self.screen.x, self.screen.y
+        ));
         let mut out = vec![
             HostEffect::SetExclusive(true),
             HostEffect::Send(SecureMsg::Enter {
@@ -222,20 +240,46 @@ impl ClientShare {
         self.cursor.is_some()
     }
 
+    pub fn cursor_pos(&self) -> Option<(i32, i32)> {
+        self.cursor.as_ref().map(|cursor| (cursor.x, cursor.y))
+    }
+
     pub fn on_msg(&mut self, msg: SecureMsg) -> Vec<ClientEffect> {
         match msg {
             SecureMsg::Enter { edge, frac } => {
                 let cursor = RemoteCursor::enter(self.screen, edge, frac);
+                diag::fact(
+                    "guest_screen",
+                    format!(
+                        "{}x{} at ({},{})",
+                        self.screen.width, self.screen.height, self.screen.x, self.screen.y
+                    ),
+                );
+                diag::fact("enter", format!("{edge:?} frac={frac}"));
+                diag::note(format!(
+                    "guest enter {edge:?} frac={frac} at ({},{}) screen {}x{} at ({},{})",
+                    cursor.x,
+                    cursor.y,
+                    self.screen.width,
+                    self.screen.height,
+                    self.screen.x,
+                    self.screen.y
+                ));
                 let effect = ClientEffect::Warp {
                     x: cursor.x,
                     y: cursor.y,
                 };
                 self.cursor = Some(cursor);
-                vec![effect]
+                vec![ClientEffect::Synthetic(true), effect]
             }
             SecureMsg::Leave { .. } | SecureMsg::Bye => {
-                self.cursor = None;
-                Vec::new()
+                let was = self.cursor.take().is_some();
+                if was {
+                    diag::note("guest leave");
+                    vec![ClientEffect::Synthetic(false)]
+                } else {
+                    Vec::new()
+                }
             }
             SecureMsg::MouseMove { dx, dy } => {
                 let Some(cursor) = self.cursor.as_mut() else {
@@ -249,6 +293,7 @@ impl ClientShare {
                 // is clamped by the OS to the display under the cursor, which
                 // trapped the pointer on one monitor and discarded the rest.
                 if ix != 0 || iy != 0 {
+                    diag::fact("logical_cursor", format!("{},{}", cursor.x, cursor.y));
                     out.push(ClientEffect::Warp {
                         x: cursor.x,
                         y: cursor.y,
@@ -257,7 +302,9 @@ impl ClientShare {
                 if let Some(frac) = leave {
                     let edge = cursor.return_edge();
                     self.cursor = None;
+                    diag::note(format!("guest leave edge={edge:?} frac={frac}"));
                     out.push(ClientEffect::Send(SecureMsg::Leave { edge, frac }));
+                    out.push(ClientEffect::Synthetic(false));
                 }
                 out
             }
@@ -307,7 +354,13 @@ mod tests {
 
         let mut client = ClientShare::new(Screen::new(200, 100));
         let cfx = client.on_msg(SecureMsg::Enter { edge, frac });
-        assert!(matches!(cfx[0], ClientEffect::Warp { x: 0, .. }));
+        assert!(cfx
+            .iter()
+            .any(|e| matches!(e, ClientEffect::Synthetic(true))));
+        assert!(matches!(
+            cfx.iter().find(|e| matches!(e, ClientEffect::Warp { .. })),
+            Some(ClientEffect::Warp { x: 0, .. })
+        ));
 
         let mut left = false;
         for _ in 0..5 {

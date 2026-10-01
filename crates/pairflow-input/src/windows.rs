@@ -15,6 +15,7 @@
 //! pointer is remote, relative motion.
 
 use super::{add_motion, Input, InputError, Platform};
+use pairflow_core::diag;
 use pairflow_proto::{InputEvent, KeyId, MouseButton, Side};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
@@ -184,7 +185,7 @@ impl Platform for WinOps {
 
     fn set_exclusive(&self, on: bool) {
         if on {
-            release_clip();
+            ensure_unclipped();
             let mut pt = POINT::default();
             unsafe {
                 if GetCursorPos(&mut pt).is_ok() {
@@ -194,6 +195,15 @@ impl Platform for WinOps {
             }
         }
         EXCLUSIVE.store(on, Ordering::Relaxed);
+    }
+    fn os_cursor(&self) -> Option<(i32, i32)> {
+        let mut pt = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut pt).is_err() {
+                return None;
+            }
+        }
+        Some((pt.x, pt.y))
     }
     fn shutdown(&self) {
         release_clip();
@@ -238,6 +248,14 @@ fn hook_thread(
         let _ = PeekMessageW(&mut warmup, None, 0, 0, PM_NOREMOVE);
     }
     let (origin_x, origin_y, width, height) = virtual_desktop();
+    diag::fact(
+        "desktop",
+        format!("{width}x{height} at ({origin_x},{origin_y})"),
+    );
+    diag::fact(
+        "injection",
+        "host deltas from the low-level hook; ClipCursor released while remote",
+    );
     DESK_X.store(origin_x, Ordering::Relaxed);
     DESK_Y.store(origin_y, Ordering::Relaxed);
     DESK_W.store(width, Ordering::Relaxed);
@@ -286,7 +304,7 @@ fn sample_cursor() {
         return;
     }
     if EXCLUSIVE.load(Ordering::Relaxed) {
-        release_clip();
+        ensure_unclipped();
         // The hook forwards motion when it fires. If it never fires (security
         // software), the cursor still moves and this poll is the only delta.
         let seq = HOOK_MOVE_SEQ.load(Ordering::Acquire);
@@ -405,6 +423,20 @@ fn release_clip() {
     }
 }
 
+/// Drop a monitor clip even when our flag was already cleared. A clip that
+/// survives into remote mode limits host deltas to that monitor, which the
+/// guest draws as a rectangle.
+fn ensure_unclipped() {
+    let was = CLIPPED.swap(false, Ordering::Relaxed);
+    unsafe {
+        let _ = ClipCursor(None);
+    }
+    if was {
+        diag::note("host ClipCursor cleared");
+        diag::fact("clip", "released");
+    }
+}
+
 fn publish_cursor(x: i32, y: i32) {
     if CUR_SEQ.load(Ordering::Relaxed) != 0
         && CUR_X.load(Ordering::Relaxed) == x
@@ -437,6 +469,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     }
     let msg = wparam.0;
     if EXCLUSIVE.load(Ordering::Relaxed) {
+        ensure_unclipped();
         match msg {
             WM_MOUSEMOVE => {
                 let ax = ANCHOR_X.load(Ordering::Relaxed);
@@ -445,7 +478,13 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 let dy = info.pt.y - ay;
                 if dx != 0 || dy != 0 {
                     add_motion(dx, dy);
-                    HOOK_MOVE_SEQ.fetch_add(1, Ordering::Release);
+                    let n = HOOK_MOVE_SEQ.fetch_add(1, Ordering::Release);
+                    if n % 25 == 0 {
+                        diag::note(format!(
+                            "host delta {dx},{dy} hook=({},{}) anchor=({ax},{ay})",
+                            info.pt.x, info.pt.y
+                        ));
+                    }
                     IN_WARP.store(true, Ordering::Relaxed);
                     let _ = SetCursorPos(ax, ay);
                     IN_WARP.store(false, Ordering::Relaxed);

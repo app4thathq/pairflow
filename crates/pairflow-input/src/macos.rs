@@ -14,7 +14,7 @@ use core_graphics::event::{
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use foreign_types::ForeignType;
-use pairflow_core::union_desktop;
+use pairflow_core::{diag, display_hit, union_desktop, DisplayRect};
 use pairflow_proto::{InputEvent, KeyId, MouseButton};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
@@ -23,6 +23,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 static EXCLUSIVE: AtomicBool = AtomicBool::new(false);
+/// Guest is placing the cursor. The hardware mouse stays dissociated.
+static SYNTHETIC: AtomicBool = AtomicBool::new(false);
 static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
 static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 /// Buttons we have injected, so a drag keeps the matching dragged event type.
@@ -43,51 +45,96 @@ struct SharedTx {
 }
 
 static TX: Mutex<SharedTx> = Mutex::new(SharedTx { tx: None });
+static DISPLAYS: Mutex<Vec<MacDisplay>> = Mutex::new(Vec::new());
 
 const SHIFT: u64 = 0x0002_0000;
 const CONTROL: u64 = 0x0004_0000;
 const ALTERNATE: u64 = 0x0008_0000;
 const COMMAND: u64 = 0x0010_0000;
 
-/// Union of every active display in Quartz global points, plus a log of each one.
+#[derive(Clone)]
+struct MacDisplay {
+    id: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    px_w: u64,
+    px_h: u64,
+}
+
+/// Union of every active display in Quartz global points, plus each display.
 ///
-/// `CGDisplay::pixels_wide` is the framebuffer size. Mouse locations use points
-/// (`bounds`), and a display to the left of the main panel has a negative origin.
-fn desktop_points() -> (i32, i32, i32, i32, String) {
-    let mut rects = Vec::new();
+/// `pixels_wide` is the framebuffer. Pointer locations use `bounds` in points.
+/// A display to the left of the main panel has a negative origin.
+fn desktop_points() -> (i32, i32, i32, i32, String, Vec<MacDisplay>) {
+    let mut displays = Vec::new();
     if let Ok(ids) = CGDisplay::active_displays() {
         for id in ids {
-            let bounds = CGDisplay::new(id).bounds();
+            let display = CGDisplay::new(id);
+            let bounds = display.bounds();
             let w = bounds.size.width.round() as i32;
             let h = bounds.size.height.round() as i32;
             if w > 0 && h > 0 {
-                rects.push((
-                    bounds.origin.x.round() as i32,
-                    bounds.origin.y.round() as i32,
+                displays.push(MacDisplay {
+                    id,
+                    x: bounds.origin.x.round() as i32,
+                    y: bounds.origin.y.round() as i32,
                     w,
                     h,
-                ));
+                    px_w: display.pixels_wide(),
+                    px_h: display.pixels_high(),
+                });
             }
         }
     }
-    let note = rects
+    if displays.is_empty() {
+        let display = CGDisplay::main();
+        let bounds = display.bounds();
+        let w = (bounds.size.width.round() as i32).max(2);
+        let h = (bounds.size.height.round() as i32).max(2);
+        displays.push(MacDisplay {
+            id: display.id,
+            x: bounds.origin.x.round() as i32,
+            y: bounds.origin.y.round() as i32,
+            w,
+            h,
+            px_w: display.pixels_wide(),
+            px_h: display.pixels_high(),
+        });
+    }
+    let rects: Vec<(i32, i32, i32, i32)> = displays.iter().map(|d| (d.x, d.y, d.w, d.h)).collect();
+    let note = displays
         .iter()
-        .map(|(x, y, w, h)| format!("({x},{y} {w}x{h})"))
+        .map(|d| {
+            let scale = if d.w > 0 {
+                d.px_w as f64 / d.w as f64
+            } else {
+                1.0
+            };
+            format!(
+                "id={} ({},{} {}x{} scale={scale:.2} px={}x{})",
+                d.id, d.x, d.y, d.w, d.h, d.px_w, d.px_h
+            )
+        })
         .collect::<Vec<_>>()
         .join(" ");
-    if let Some((x, y, w, h)) = union_desktop(&rects) {
-        return (x, y, w, h, note);
-    }
-    let bounds = CGDisplay::main().bounds();
-    let w = (bounds.size.width.round() as i32).max(2);
-    let h = (bounds.size.height.round() as i32).max(2);
-    let x = bounds.origin.x.round() as i32;
-    let y = bounds.origin.y.round() as i32;
-    (x, y, w, h, format!("({x},{y} {w}x{h})"))
+    let (x, y, w, h) = union_desktop(&rects).unwrap_or((0, 0, 2, 2));
+    (x, y, w, h, note, displays)
 }
 
 pub fn open() -> Result<Input, InputError> {
-    let (origin_x, origin_y, width, height, geometry) = desktop_points();
+    let (origin_x, origin_y, width, height, geometry, displays) = desktop_points();
+    diag::fact(
+        "desktop",
+        format!("{width}x{height} at ({origin_x},{origin_y})"),
+    );
+    diag::fact("displays", &geometry);
+    diag::fact(
+        "injection",
+        "guest: CGDisplayMoveCursorToPoint in that display's local points; mouse dissociated while remote",
+    );
+    *DISPLAYS.lock().unwrap() = displays.clone();
     let (event_tx, event_rx) = sync_channel(1024);
     {
         TX.lock().unwrap().tx = Some(event_tx.clone());
@@ -132,12 +179,35 @@ impl Platform for MacOps {
     fn warp(&self, x: i32, y: i32) {
         ANCHOR_X.store(x, Ordering::Relaxed);
         ANCHOR_Y.store(y, Ordering::Relaxed);
-        // Guest placement. CGWarpMouseCursorPosition is the wrong call here:
-        // on a multi-display Mac it confines the visible cursor to a rectangle
-        // the size of the main display, so an external screen only shows a box
-        // and the built-in panel stays unreachable. An absolute mouse-moved
-        // event is what actually crosses displays.
-        place_pointer(x, y);
+        if SYNTHETIC.load(Ordering::Relaxed) {
+            // Guest placement. Both CGWarp and a zero-delta mouse-moved event
+            // stay on the WindowServer path that confines the cursor to a
+            // main-display-sized box. Move on the display that contains the
+            // point, in that display's own coordinates.
+            place_on_display(x, y);
+        } else {
+            let point = CGPoint::new(x as f64, y as f64);
+            let result = CGDisplay::warp_mouse_cursor_position(point);
+            diag::note(format!("host warp ({x},{y}) cgwarp={result:?}"));
+        }
+    }
+    fn set_synthetic_cursor(&self, on: bool) {
+        SYNTHETIC.store(on, Ordering::Relaxed);
+        if on {
+            if let Ok(source) = place_source() {
+                silence_suppression(&source);
+            }
+            let result = CGDisplay::associate_mouse_and_mouse_cursor_position(false);
+            diag::fact("mouse_associated", "false");
+            diag::note(format!("dissociate mouse result={result:?}"));
+        } else {
+            let result = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
+            diag::fact("mouse_associated", "true");
+            diag::note(format!("associate mouse result={result:?}"));
+        }
+    }
+    fn os_cursor(&self) -> Option<(i32, i32)> {
+        current_pointer()
     }
     fn set_exclusive(&self, on: bool) {
         if on {
@@ -149,6 +219,8 @@ impl Platform for MacOps {
         EXCLUSIVE.store(on, Ordering::Relaxed);
     }
     fn shutdown(&self) {
+        let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
+        SYNTHETIC.store(false, Ordering::Relaxed);
         STOP.store(true, Ordering::Relaxed);
         if let Some(join) = self.join.lock().unwrap().take() {
             let _ = join.join();
@@ -360,36 +432,88 @@ fn place_source() -> Result<CGEventSource, ()> {
     CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
 }
 
-/// Move the cursor to a global display point, including a point on another display.
+/// Place the cursor on the display that contains the global point.
 ///
-/// `CGWarpMouseCursorPosition` clamps to a box the size of the main display
-/// (Qt and others document the same failure). Posting `kCGEventMouseMoved`
-/// at the absolute point, with deltas forced to 0, is the placement WindowServer
-/// will apply on every display. A non-zero delta is clipped to the display
-/// currently under the cursor, which is the box the guest was stuck in.
+/// `CGWarpMouseCursorPosition` and a zero-delta `kCGEventMouseMoved` both leave
+/// the cursor on the WindowServer path that confines it to a main-display-sized
+/// box. `CGDisplayMoveCursorToPoint` takes the display id and a point in that
+/// display's local coordinates (top-left origin). v0.2.1 also called
+/// `CGAssociateMouseAndMouseCursorPosition(true)` after every move, which
+/// couples the cursor back to the hardware mouse on whichever panel that
+/// mouse still occupies.
 fn place_pointer(x: i32, y: i32) {
+    place_on_display(x, y);
+}
+
+fn place_on_display(x: i32, y: i32) {
+    let displays = DISPLAYS.lock().unwrap().clone();
+    let rects: Vec<DisplayRect> = displays
+        .iter()
+        .map(|d| DisplayRect {
+            x: d.x,
+            y: d.y,
+            width: d.w,
+            height: d.h,
+        })
+        .collect();
+    let Some(hit) = display_hit(&rects, x, y) else {
+        diag::note(format!("place ({x},{y}) no displays"));
+        return;
+    };
+    let display = &displays[hit.index];
+    if let Ok(source) = place_source() {
+        silence_suppression(&source);
+    }
+    let local = CGPoint::new(hit.local_x as f64, hit.local_y as f64);
+    let moved = CGDisplay::new(display.id).move_cursor_to_point(local);
+    let os = current_pointer();
+    let off = os
+        .map(|(ox, oy)| (ox - x).abs() + (oy - y).abs())
+        .unwrap_or(i32::MAX);
+    if off > 12 {
+        // The per-display move did not stick. Post the real travel (not a
+        // zero delta) below the HID tap, then place on the display again.
+        post_session_move(x, y, os);
+        let _ = CGDisplay::new(display.id).move_cursor_to_point(local);
+    }
+    let os2 = current_pointer();
+    diag::fact(
+        "last_place",
+        format!(
+            "req=({x},{y}) display={} local=({},{}) clamped={} move={moved:?} os={os2:?}",
+            display.id, hit.local_x, hit.local_y, hit.clamped
+        ),
+    );
+    diag::note(format!(
+        "place req=({x},{y}) display={} local=({},{}) clamped={} move={moved:?} os1={os:?} os2={os2:?}",
+        display.id, hit.local_x, hit.local_y, hit.clamped
+    ));
+}
+
+fn post_session_move(x: i32, y: i32, from: Option<(i32, i32)>) {
     let Ok(source) = place_source() else {
         return;
     };
     silence_suppression(&source);
+    let (fx, fy) = from.unwrap_or((x, y));
     let point = CGPoint::new(x as f64, y as f64);
-    let kind = drag_or_move();
     let Ok(event) = CGEvent::new_mouse_event(
         source,
-        kind,
+        drag_or_move(),
         point,
         core_graphics::event::CGMouseButton::Left,
     ) else {
         return;
     };
     event.set_location(point);
-    event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, 0);
-    event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, 0);
-    event.set_double_value_field(EventField::MOUSE_EVENT_DELTA_X, 0.0);
-    event.set_double_value_field(EventField::MOUSE_EVENT_DELTA_Y, 0.0);
+    let dx = i64::from(x - fx);
+    let dy = i64::from(y - fy);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy);
+    event.set_double_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as f64);
+    event.set_double_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as f64);
     event.set_integer_value_field(EVENT_SOURCE_USER_DATA, PAIRFLOW_MARK);
-    event.post(CGEventTapLocation::HID);
-    let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
+    event.post(CGEventTapLocation::AnnotatedSession);
 }
 
 fn drag_or_move() -> CGEventType {

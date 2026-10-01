@@ -31,6 +31,12 @@ pub(crate) trait Platform: Send {
     fn warp(&self, x: i32, y: i32);
     fn set_exclusive(&self, on: bool);
     fn shutdown(&self);
+    /// Guest is driving this machine's cursor from the other computer.
+    fn set_synthetic_cursor(&self, _on: bool) {}
+    /// Where the OS says the cursor is, after placement.
+    fn os_cursor(&self) -> Option<(i32, i32)> {
+        None
+    }
     /// Latest absolute cursor sample, if it changed since the previous call.
     /// Backends use this so a full event queue cannot drop the edge position.
     fn take_pointer(&self) -> Option<InputEvent> {
@@ -165,6 +171,14 @@ impl Input {
 
     pub fn set_exclusive(&self, on: bool) {
         self.ops.set_exclusive(on);
+    }
+
+    pub fn set_synthetic_cursor(&self, on: bool) {
+        self.ops.set_synthetic_cursor(on);
+    }
+
+    pub fn os_cursor(&self) -> Option<(i32, i32)> {
+        self.ops.os_cursor()
     }
 
     /// Tell the capture backend which edge the peer sits on.

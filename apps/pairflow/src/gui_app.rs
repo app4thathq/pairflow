@@ -61,6 +61,7 @@ enum TrayCmd {
     CheckUpdate,
     #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
     InstallUpdate,
+    CopyDiagnostics,
     Quit,
 }
 
@@ -336,6 +337,16 @@ impl PairflowApp {
             }
             TrayCmd::CheckUpdate => self.check_update(true),
             TrayCmd::InstallUpdate => self.install_update(),
+            TrayCmd::CopyDiagnostics => {
+                let (text, path) = crate::diagnostics_text();
+                ctx.copy_text(text);
+                self.detail = format!(
+                    "Diagnostics copied. Paste them into the report. Also saved at {}",
+                    path.display()
+                );
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                self.refresh_tray();
+            }
             TrayCmd::Quit => {
                 disconnect();
                 std::thread::sleep(Duration::from_millis(150));
@@ -426,9 +437,16 @@ impl eframe::App for PairflowApp {
                 }
             }
             ui.add_space(12.0);
+            if ui.button("Copy diagnostics").clicked() {
+                self.handle_tray(ctx, TrayCmd::CopyDiagnostics);
+            }
+            ui.label(
+                "After the pointer is on the other computer, move around the limited area, then Copy diagnostics and paste the text back. The same command is in the tray menu.",
+            );
+            ui.add_space(12.0);
             ui.label("Closing this window keeps Pairflow in the tray. Quit exits.");
             ui.label(
-                "The peer sits on the outer right of the Windows desktop. On a Mac guest the pointer is placed on the full desktop, every display included.",
+                "The peer sits on the outer right of the Windows desktop. On a Mac guest the pointer is placed on each display in that display's own coordinates.",
             );
         });
     }
@@ -532,6 +550,7 @@ fn native_tray(
                 "disconnect" => TrayCmd::Disconnect,
                 "update" => TrayCmd::CheckUpdate,
                 "install" => TrayCmd::InstallUpdate,
+                "diag" => TrayCmd::CopyDiagnostics,
                 "quit" => TrayCmd::Quit,
                 _ => continue,
             };
@@ -557,6 +576,7 @@ fn tray_menu(
     let join = MenuItem::with_id("join", "Join…", true, None);
     let disconnect = MenuItem::with_id("disconnect", "Disconnect", true, None);
     let check = MenuItem::with_id("update", "Check for updates", true, None);
+    let diag = MenuItem::with_id("diag", "Copy diagnostics", true, None);
     let quit = MenuItem::with_id("quit", "Quit", true, None);
     menu.append(&status_item).map_err(|e| e.to_string())?;
     if !code.is_empty() {
@@ -571,6 +591,7 @@ fn tray_menu(
     menu.append(&disconnect).map_err(|e| e.to_string())?;
     menu.append(&PredefinedMenuItem::separator())
         .map_err(|e| e.to_string())?;
+    menu.append(&diag).map_err(|e| e.to_string())?;
     menu.append(&check).map_err(|e| e.to_string())?;
     if let Some(label) = install {
         let install_item = MenuItem::with_id("install", label, true, None);
@@ -670,6 +691,16 @@ impl ksni::Tray for LinuxTray {
                 label: "Disconnect".into(),
                 activate: Box::new(|this: &mut Self| {
                     let _ = this.tx.send(TrayCmd::Disconnect);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Copy diagnostics".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.tx.send(TrayCmd::CopyDiagnostics);
                 }),
                 ..Default::default()
             }

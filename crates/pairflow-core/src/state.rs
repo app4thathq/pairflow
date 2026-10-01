@@ -178,6 +178,13 @@ pub enum LaunchAction {
     Idle,
 }
 
+pub fn diagnostics_path() -> PathBuf {
+    default_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("diagnostics.txt")
+}
+
 fn default_path() -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join("pairflow").join("state.json")
