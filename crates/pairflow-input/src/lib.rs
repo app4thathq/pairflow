@@ -1,0 +1,144 @@
+//! OS input capture and injection.
+//!
+//! The host captures pointer position and, once the pointer crosses onto the
+//! peer, grabs the keyboard and mouse so local applications stop seeing those
+//! events. The client injects the stream it is sent.
+//!
+//! If a real backend cannot be opened (no X11 display, missing Accessibility
+//! permission, and so on) callers can use [`Input::dry_run`], which only
+//! forwards events pushed with [`Input::emit`].
+
+use pairflow_proto::InputEvent;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[derive(Debug, thiserror::Error)]
+pub enum InputError {
+    #[error("{0}")]
+    Message(String),
+}
+
+pub(crate) trait Platform: Send {
+    fn inject(&self, ev: InputEvent);
+    fn warp(&self, x: i32, y: i32);
+    fn set_exclusive(&self, on: bool);
+    fn shutdown(&self);
+}
+
+pub struct Input {
+    pub width: i32,
+    pub height: i32,
+    event_tx: SyncSender<InputEvent>,
+    event_rx: Receiver<InputEvent>,
+    ops: Box<dyn Platform>,
+}
+
+impl Input {
+    pub fn open(dry_run: bool) -> Self {
+        if !dry_run {
+            #[cfg(target_os = "linux")]
+            match linux::open() {
+                Ok(input) => return input,
+                Err(err) => eprintln!("pairflow: {err}"),
+            }
+            #[cfg(target_os = "windows")]
+            match windows::open() {
+                Ok(input) => return input,
+                Err(err) => eprintln!("pairflow: {err}"),
+            }
+            #[cfg(target_os = "macos")]
+            match macos::open() {
+                Ok(input) => return input,
+                Err(err) => eprintln!("pairflow: {err}"),
+            }
+            eprintln!("pairflow: using dry-run input. Type `help` for stdin controls.");
+        }
+        Self::dry_run()
+    }
+
+    pub fn dry_run() -> Self {
+        let (event_tx, event_rx) = sync_channel(1024);
+        Self {
+            width: 1920,
+            height: 1080,
+            event_tx,
+            event_rx,
+            ops: Box::new(NullPlatform),
+        }
+    }
+
+    pub(crate) fn from_channel(
+        width: i32,
+        height: i32,
+        event_tx: SyncSender<InputEvent>,
+        event_rx: Receiver<InputEvent>,
+        ops: Box<dyn Platform>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            event_tx,
+            event_rx,
+            ops,
+        }
+    }
+
+    pub fn emitter(&self) -> SyncSender<InputEvent> {
+        self.event_tx.clone()
+    }
+
+    pub fn emit(&self, ev: InputEvent) {
+        match self.event_tx.try_send(ev) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    pub fn try_recv(&self) -> Option<InputEvent> {
+        self.event_rx.try_recv().ok()
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<InputEvent> {
+        self.event_rx.recv_timeout(timeout).ok()
+    }
+
+    pub fn inject(&self, ev: InputEvent) {
+        self.ops.inject(ev);
+    }
+
+    pub fn warp(&self, x: i32, y: i32) {
+        self.ops.warp(x, y);
+    }
+
+    pub fn set_exclusive(&self, on: bool) {
+        self.ops.set_exclusive(on);
+    }
+}
+
+impl Drop for Input {
+    fn drop(&mut self) {
+        self.ops.shutdown();
+    }
+}
+
+struct NullPlatform;
+
+impl Platform for NullPlatform {
+    fn inject(&self, ev: InputEvent) {
+        eprintln!("pairflow dry-run inject: {ev:?}");
+    }
+    fn warp(&self, x: i32, y: i32) {
+        eprintln!("pairflow dry-run warp: {x},{y}");
+    }
+    fn set_exclusive(&self, on: bool) {
+        eprintln!("pairflow dry-run exclusive: {on}");
+    }
+    fn shutdown(&self) {}
+}
