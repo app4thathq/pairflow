@@ -70,6 +70,11 @@ the macOS menu bar, or the Linux status icon.
 - **Check for updates** (Windows and macOS) looks at the public GitHub Releases
   page. **Install** appears when a newer version is published. Nothing is
   replaced until you choose Install.
+- **Copy diagnostics** copies a text blob (and writes the same text to
+  `diagnostics.txt` next to the saved state file). After the pointer has been
+  on the other computer, move through the area you can reach, choose Copy
+  diagnostics on that computer, and paste the text into the report. The status
+  window has the same button.
 
 The next time the guest opens Pairflow, it starts joining that saved code in
 the background. The tray says `Reconnecting to K7NQ2…`, then `Paired with …`.
@@ -125,11 +130,9 @@ of its own desktop and can move across the external screen onto the Mac.
 
 Remote motion follows the host cursor. Pairflow sums the host's pointer
 deltas (on Windows those already include the system's mouse acceleration) and
-places the guest cursor at that absolute point. On macOS the placement is a
-mouse-moved event with the deltas forced to zero. `CGWarpMouseCursorPosition`
-is not used for this: it confines the cursor to a box the size of the main
-display, which on a wide external screen looks like a rectangle covering
-roughly the left portion of that screen and never reaches the built-in panel.
+places the guest cursor on the display that contains that point, in that
+display's own coordinates. On macOS the hardware mouse is disconnected while
+the pointer is remote, so it cannot pull the cursor back onto one panel.
 `--sensitivity 1.0` (the default) keeps 1:1 travel. `pairflow join --sensitivity 1.5`
 scales it and is remembered. The useful range is `0.1` to `8`.
 

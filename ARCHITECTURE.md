@@ -260,8 +260,10 @@ not see input on the secure desktop (the lock screen, UAC prompts).
 - If `SetWindowsHookEx` fails, the poll still runs and the banner says the
   hooks are not active. The host does not fall back to a quiet dry-run.
 - Remote mode swallows the event when the hook is alive (the hook returns 1),
-  forwards the delta from an anchor, and `SetCursorPos`s back. If the hook
-  never fires, the poll forwards that delta instead. A re-entry flag ignores
+  forwards the delta from an anchor, and `SetCursorPos`s back. `ClipCursor(NULL)`
+  runs on each swallowed move, including when Pairflow's clip flag was already
+  cleared, so a monitor clip cannot limit those deltas to one screen. If the
+  hook never fires, the poll forwards that delta instead. A re-entry flag ignores
   the warp.
 - Events with the injected flag are ignored so the client's own `SendInput`
   is not captured again.
@@ -283,19 +285,19 @@ pointer is remote. While this Mac is the host, `CGWarpMouseCursorPosition`
 parks the cursor on the anchor without generating a new event. That call is
 only safe for a point the cursor already occupies.
 
-Guest placement does not use it. `CGWarpMouseCursorPosition` confines the
-visible cursor to a rectangle the size of the main display, even when the
-logical desktop is the union of every `CGDisplay` bounds in points. With the
-external screen to the left of the built-in panel, that box sits on the
-external (about 40% of a wide panel) and the built-in display stays
-unreachable. v0.2.0 already measured the union correctly; the warp was the
-clamp. Placement posts `kCGEventMouseMoved` (or the matching dragged type)
-at the absolute global point, with integer and double deltas forced to 0, on
-a session event source whose suppression interval is 0. A non-zero delta is
-clipped to the display under the cursor, which is the same box. The event is
-marked with `kCGEventSourceUserData` so the tap keeps it and does not treat
-it as physical motion. `CGAssociateMouseAndMouseCursorPosition(true)` follows
-the post. Injected buttons, scroll, and keys are marked the same way.
+Guest placement does not use a global warp or a zero-delta mouse event.
+v0.2.0's `CGWarpMouseCursorPosition` and v0.2.1's `kCGEventMouseMoved` with
+deltas forced to 0 both stay on the WindowServer path that confines the
+visible cursor to a main-display-sized box, and v0.2.1 reassociated the
+hardware mouse after every move, which pulls the cursor back to the panel
+that mouse still occupies. While the pointer is remote, Pairflow disconnects
+the hardware mouse and calls `CGDisplayMoveCursorToPoint` on the display that
+contains the logical point, in that display's local coordinates. If the OS
+cursor readback is not the requested point, it posts one session mouse-moved
+event with the real delta and places on the display again. Reassociation
+happens when the pointer returns. The capture tap still ignores events marked
+with `kCGEventSourceUserData`. Host parking, while this Mac owns the mouse,
+still uses `CGWarpMouseCursorPosition`.
 
 The guest desktop is the union of `CGDisplay::active_displays()` bounds in
 points. Injection posts `CGEvent`s for buttons, line-based scroll, and
@@ -316,6 +318,17 @@ backend diffs the flag word and emits the logical modifier keys.
 The dmg contains universal binaries (`lipo` of `aarch64-apple-darwin` and
 `x86_64-apple-darwin`) for the tray app and the CLI.
 `Pairflow.app/Contents/MacOS/pairflow-cli` is the shell binary.
+
+## Diagnostics
+
+The tray item **Copy diagnostics** (and the same button in the status window)
+copies a blob and writes `diagnostics.txt` beside `state.json`. The blob has
+the version, OS, role, each display rectangle with its backing scale, the
+desktop union, the enter edge, the logical cursor, the last placement
+(requested point, display id, local point, OS readback), whether the hardware
+mouse is dissociated, and the recent host deltas or guest samples. Capture it
+on the machine that shows the limited rectangle, after moving inside that
+rectangle, and paste the whole text.
 
 ## Updates
 

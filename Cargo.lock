@@ -2772,7 +2772,7 @@ dependencies = [
 
 [[package]]
 name = "pairflow"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap 4.6.7",
  "ctrlc",
@@ -2788,7 +2788,7 @@ dependencies = [
 
 [[package]]
 name = "pairflow-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chacha20poly1305",
  "dirs 5.0.1",
@@ -2809,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "pairflow-input"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
@@ -2823,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "pairflow-proto"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "thiserror 1.0.69",
 ]

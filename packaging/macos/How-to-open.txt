@@ -23,8 +23,11 @@ Terminal:
 
 System Settings → Privacy & Security → Accessibility → enable Pairflow.
 
-The guest pointer covers every display on this Mac, including a screen that
-sits to the left of the built-in panel.
+The guest pointer is placed on each display in that display's own coordinates,
+including a screen to the left of the built-in panel.
+
+If the cursor is still stuck in a rectangle, move inside that rectangle, then
+choose Copy diagnostics in the menu bar and paste the text into the report.
 
 Updates
 -------
