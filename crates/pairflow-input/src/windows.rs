@@ -2,16 +2,25 @@
 //!
 //! Low-level hooks do not need an administrator account. They do not see input
 //! on the secure desktop (UAC prompts, the lock screen).
+//!
+//! Cursor coordinates and the desktop rectangle are both read after enabling
+//! per-monitor DPI awareness, so they stay in physical pixels. The desktop is
+//! the virtual screen (every monitor). The latest cursor position is stored
+//! in atomics, so a burst of events cannot drop the sample that sits on the
+//! outer edge.
 
 use super::{Input, InputError, Platform};
 use pairflow_proto::{InputEvent, KeyId, MouseButton};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
@@ -20,9 +29,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetCursorPos, GetMessageW, GetSystemMetrics, PostThreadMessageW, SetCursorPos,
-    SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-    SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    CallNextHookEx, GetCursorPos, GetSystemMetrics, PeekMessageW, PostThreadMessageW, SetCursorPos,
+    SetProcessDPIAware, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG,
+    MSLLHOOKSTRUCT, PM_REMOVE, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL,
 };
 
 const WM_QUIT: u32 = 0x0012;
@@ -57,14 +67,14 @@ static EXCLUSIVE: AtomicBool = AtomicBool::new(false);
 static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
 static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 static IN_WARP: AtomicBool = AtomicBool::new(false);
+static CUR_X: AtomicI32 = AtomicI32::new(0);
+static CUR_Y: AtomicI32 = AtomicI32::new(0);
+/// 0 means no sample yet. Each new cursor position increments this.
+static CUR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn open() -> Result<Input, InputError> {
-    let (width, height) = unsafe {
-        (
-            GetSystemMetrics(SM_CXSCREEN).max(2),
-            GetSystemMetrics(SM_CYSCREEN).max(2),
-        )
-    };
+    enable_dpi_awareness();
+    let (origin_x, origin_y, width, height) = virtual_desktop();
     let (event_tx, event_rx) = sync_channel(1024);
     let thread_tx = event_tx.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -80,18 +90,51 @@ pub fn open() -> Result<Input, InputError> {
         ));
     }
     Ok(Input::from_channel(
+        origin_x,
+        origin_y,
         width,
         height,
         event_tx,
         event_rx,
         Box::new(WinOps {
             join: std::sync::Mutex::new(Some(join)),
+            last_seq: AtomicU64::new(0),
         }),
     ))
 }
 
+fn enable_dpi_awareness() {
+    unsafe {
+        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_err() {
+            let _ = SetProcessDPIAware();
+        }
+    }
+}
+
+fn virtual_desktop() -> (i32, i32, i32, i32) {
+    unsafe {
+        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if width > 1 && height > 1 {
+            return (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                width,
+                height,
+            );
+        }
+        (
+            0,
+            0,
+            GetSystemMetrics(SM_CXSCREEN).max(2),
+            GetSystemMetrics(SM_CYSCREEN).max(2),
+        )
+    }
+}
+
 struct WinOps {
     join: Mutex<Option<JoinHandle<()>>>,
+    last_seq: AtomicU64,
 }
 
 impl Platform for WinOps {
@@ -132,6 +175,21 @@ impl Platform for WinOps {
             let _ = join.join();
         }
     }
+
+    fn take_pointer(&self) -> Option<InputEvent> {
+        let seq = CUR_SEQ.load(Ordering::Acquire);
+        if seq == 0 {
+            return None;
+        }
+        let prev = self.last_seq.swap(seq, Ordering::AcqRel);
+        if prev == seq {
+            return None;
+        }
+        Some(InputEvent::PointerAt {
+            x: CUR_X.load(Ordering::Relaxed),
+            y: CUR_Y.load(Ordering::Relaxed),
+        })
+    }
 }
 
 fn hook_thread(tx: SyncSender<InputEvent>, ready: std::sync::mpsc::Sender<Option<String>>) {
@@ -150,15 +208,47 @@ fn hook_thread(tx: SyncSender<InputEvent>, ready: std::sync::mpsc::Sender<Option
     }
     let _ = ready.send(None);
     unsafe {
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
-            windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+        loop {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    let _ = UnhookWindowsHookEx(mouse);
+                    let _ = UnhookWindowsHookEx(key);
+                    HOOK.lock().unwrap().tx = None;
+                    return;
+                }
+                let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+            }
+            sample_cursor();
+            thread::sleep(std::time::Duration::from_millis(8));
         }
-        let _ = UnhookWindowsHookEx(mouse);
-        let _ = UnhookWindowsHookEx(key);
-        HOOK.lock().unwrap().tx = None;
     }
+}
+
+fn sample_cursor() {
+    if EXCLUSIVE.load(Ordering::Relaxed) || IN_WARP.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut pt = windows::Win32::Foundation::POINT::default();
+    unsafe {
+        if GetCursorPos(&mut pt).is_err() {
+            return;
+        }
+    }
+    publish_cursor(pt.x, pt.y);
+}
+
+fn publish_cursor(x: i32, y: i32) {
+    if CUR_SEQ.load(Ordering::Relaxed) != 0
+        && CUR_X.load(Ordering::Relaxed) == x
+        && CUR_Y.load(Ordering::Relaxed) == y
+    {
+        return;
+    }
+    CUR_X.store(x, Ordering::Relaxed);
+    CUR_Y.store(y, Ordering::Relaxed);
+    CUR_SEQ.fetch_add(1, Ordering::Release);
 }
 
 unsafe fn install() -> Result<(HHOOK, HHOOK), String> {
@@ -213,10 +303,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         return LRESULT(1);
     }
     if msg == WM_MOUSEMOVE {
-        emit(InputEvent::PointerAt {
-            x: info.pt.x,
-            y: info.pt.y,
-        });
+        publish_cursor(info.pt.x, info.pt.y);
     }
     CallNextHookEx(None, code, wparam, lparam)
 }

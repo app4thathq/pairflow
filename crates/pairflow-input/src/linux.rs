@@ -74,6 +74,8 @@ pub fn open() -> Result<Input, InputError> {
         join: std::sync::Mutex::new(Some(join)),
     };
     Ok(Input::from_channel(
+        0,
+        0,
         width,
         height,
         event_tx,

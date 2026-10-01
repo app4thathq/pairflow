@@ -300,7 +300,7 @@ fn run_host(
     let identity = Identity::load(new_code, explicit).map_err(|e| e.to_string())?;
     let addr: SocketAddr = listen.parse().map_err(|e| format!("listen address: {e}"))?;
     let input = Input::open(dry_run);
-    let screen = Screen::new(input.width, input.height);
+    let screen = Screen::with_origin(input.origin_x, input.origin_y, input.width, input.height);
     spawn_stdin(input.emitter(), screen, Some(side), running.clone());
     let listener = HostListener::bind(
         addr,
@@ -321,7 +321,7 @@ fn run_host(
         mdns,
         udp,
     );
-    print_host_banner(&identity.code, side, bound.port());
+    print_host_banner(&identity.code, side, bound.port(), screen);
     while running.load(Ordering::Relaxed) {
         let Some((session, peer)) = listener
             .accept_authenticated(running)
@@ -371,7 +371,7 @@ fn run_join(
         return Err("pass a 5-character code, for example: pairflow join K7NQ2".into());
     };
     let input = Input::open(dry_run);
-    let screen = Screen::new(input.width, input.height);
+    let screen = Screen::with_origin(input.origin_x, input.origin_y, input.width, input.height);
     spawn_stdin(input.emitter(), screen, None, running.clone());
     println!("joining with code {code}");
     if direct.is_none() {
@@ -571,12 +571,19 @@ fn note_focus(was: bool, now: bool) {
     }
 }
 
-fn print_host_banner(code: &str, side: Side, port: u16) {
+fn print_host_banner(code: &str, side: Side, port: u16, screen: Screen) {
     println!();
     println!("  Pairing code:  {code}");
     println!();
     println!("  On the other computer:  pairflow join {code}");
-    println!("  Peer sits to the {} of this screen.", side.name());
+    println!(
+        "  Desktop: {}x{} at ({},{}). Peer is the outer {} edge.",
+        screen.width,
+        screen.height,
+        screen.x,
+        screen.y,
+        side.name()
+    );
     println!("  Listening on TCP {port} (UDP discovery {DEFAULT_UDP_PORT}).");
     println!("  Release hotkey: Ctrl+Alt+F12");
     println!("  Stdin: help, edge, pos X Y, move DX DY, key NAME down|up, quit");
@@ -632,10 +639,10 @@ fn handle_line(
                 .or(default_side)
                 .unwrap_or(Side::Right);
             let (x, y) = match side {
-                Side::Right => (screen.width - 1, screen.height / 2),
-                Side::Left => (0, screen.height / 2),
-                Side::Top => (screen.width / 2, 0),
-                Side::Bottom => (screen.width / 2, screen.height - 1),
+                Side::Right => (screen.right() - 1, screen.y + screen.height / 2),
+                Side::Left => (screen.x, screen.y + screen.height / 2),
+                Side::Top => (screen.x + screen.width / 2, screen.y),
+                Side::Bottom => (screen.x + screen.width / 2, screen.bottom() - 1),
             };
             send(InputEvent::PointerAt { x, y });
             true

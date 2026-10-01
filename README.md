@@ -115,6 +115,15 @@ hooks do not receive input on the secure desktop (the lock screen and UAC
 prompts). You may need to allow `pairflow.exe` through the firewall for private
 networks so TCP `24816` and UDP `24817` work.
 
+The other computer sits on the **outer** edge of the whole Windows desktop.
+With two monitors side by side and `--side right`, push the pointer off the
+right side of the right-hand monitor. The seam between the two Windows
+monitors stays on Windows. Pairflow turns on per-monitor DPI awareness so that
+edge is the same pixel the cursor uses. The host prints `pointer is on the
+other computer` when the crossing succeeds. If that line appears and the Mac
+still does not move, grant Accessibility and Input Monitoring to Pairflow on
+the Mac.
+
 **Linux.** An X11 session is required (`DISPLAY` must be set). Wayland is not
 supported yet; XWayland sometimes works, and grabs there are best-effort. The
 XTest extension must be enabled, which it is on ordinary X.Org. If capture

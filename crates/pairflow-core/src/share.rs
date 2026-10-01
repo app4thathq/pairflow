@@ -30,6 +30,8 @@ pub struct HostShare {
     pub peer_side: Side,
     pub remote: bool,
     edge_latched: bool,
+    /// Last local cursor position. Relative moves walk this until it hits an edge.
+    pos: Option<(i32, i32)>,
     mods: BTreeSet<KeyId>,
 }
 
@@ -40,6 +42,7 @@ impl HostShare {
             peer_side,
             remote: false,
             edge_latched: false,
+            pos: None,
             mods: BTreeSet::new(),
         }
     }
@@ -48,8 +51,14 @@ impl HostShare {
         match ev {
             InputEvent::PointerAt { x, y } => self.on_pointer(x, y),
             InputEvent::MouseMove { dx, dy } => {
-                if self.remote && (dx != 0 || dy != 0) {
-                    vec![HostEffect::Send(SecureMsg::MouseMove { dx, dy })]
+                if self.remote {
+                    if dx != 0 || dy != 0 {
+                        vec![HostEffect::Send(SecureMsg::MouseMove { dx, dy })]
+                    } else {
+                        Vec::new()
+                    }
+                } else if let Some((x, y)) = self.pos {
+                    self.on_pointer(x.saturating_add(dx), y.saturating_add(dy))
                 } else {
                     Vec::new()
                 }
@@ -90,6 +99,7 @@ impl HostShare {
         if self.remote {
             return Vec::new();
         }
+        self.pos = Some((x, y));
         match hit_edge(self.screen, x, y, self.peer_side, EDGE_MARGIN) {
             Some(frac) if !self.edge_latched => self.enter(frac),
             Some(_) => Vec::new(),
@@ -160,6 +170,7 @@ impl HostShare {
             }));
         }
         let (x, y) = inset_point(self.screen, self.peer_side, frac, EDGE_INSET);
+        self.pos = Some((x, y));
         out.push(HostEffect::SetExclusive(false));
         out.push(HostEffect::Warp { x, y });
         out
@@ -302,6 +313,52 @@ mod tests {
             .iter()
             .any(|e| matches!(e, HostEffect::Send(SecureMsg::Leave { .. }))));
         assert!(fx.iter().any(|e| matches!(e, HostEffect::Warp { .. })));
+    }
+
+    #[test]
+    fn relative_moves_walk_off_the_right_edge() {
+        let mut host = HostShare::new(Screen::new(1920, 1080), Side::Right);
+        assert!(host
+            .on_input(InputEvent::MouseMove { dx: 4000, dy: 0 })
+            .is_empty());
+        host.on_input(InputEvent::PointerAt { x: 1900, y: 200 });
+        assert!(!host.remote);
+        let fx = host.on_input(InputEvent::MouseMove { dx: 30, dy: 0 });
+        assert!(host.remote);
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            HostEffect::Send(SecureMsg::Enter {
+                edge: Side::Left,
+                ..
+            })
+        )));
+        let forwarded = host.on_input(InputEvent::MouseMove { dx: 4, dy: -1 });
+        assert_eq!(
+            forwarded,
+            vec![HostEffect::Send(SecureMsg::MouseMove { dx: 4, dy: -1 })]
+        );
+    }
+
+    #[test]
+    fn jumping_past_the_right_edge_enters_remote() {
+        let mut host = HostShare::new(Screen::new(1920, 1080), Side::Right);
+        host.on_input(InputEvent::PointerAt { x: 10, y: 10 });
+        assert!(!host.remote);
+        host.on_input(InputEvent::PointerAt { x: 1919, y: 10 });
+        assert!(host.remote);
+    }
+
+    #[test]
+    fn second_windows_monitor_is_not_the_peer() {
+        let mut host = HostShare::new(Screen::with_origin(0, 0, 3840, 1080), Side::Right);
+        host.on_input(InputEvent::PointerAt { x: 100, y: 100 });
+        host.on_input(InputEvent::MouseMove { dx: 1800, dy: 0 });
+        assert!(
+            !host.remote,
+            "x=1900 is still on the first of two 1920-wide monitors"
+        );
+        host.on_input(InputEvent::PointerAt { x: 3839, y: 100 });
+        assert!(host.remote);
     }
 
     #[test]
