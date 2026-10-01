@@ -54,6 +54,8 @@ pub struct Input {
     pub live: bool,
     /// Short label for the startup banner (`Windows hooks active`, `DRY-RUN`, ...).
     pub backend: &'static str,
+    /// Per-display rectangles in pointer coordinates, when the backend knows them.
+    pub geometry: String,
     event_tx: SyncSender<InputEvent>,
     event_rx: Receiver<InputEvent>,
     ops: Box<dyn Platform>,
@@ -93,6 +95,7 @@ impl Input {
             height: 1080,
             live: false,
             backend: "DRY-RUN (stdin only, real mouse ignored)",
+            geometry: String::new(),
             event_tx,
             event_rx,
             ops: Box::new(NullPlatform),
@@ -115,6 +118,7 @@ impl Input {
             height,
             live: true,
             backend: backend_name(),
+            geometry: String::new(),
             event_tx,
             event_rx,
             ops,

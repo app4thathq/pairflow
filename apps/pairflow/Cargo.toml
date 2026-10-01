@@ -25,10 +25,16 @@ pairflow-core.workspace = true
 pairflow-input.workspace = true
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
+serde_json.workspace = true
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = "0.19"
+# schannel on Windows, Security.framework on macOS. No C toolchain for ring.
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+
+[target.'cfg(not(any(target_os = "windows", target_os = "macos")))'.dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11"] }

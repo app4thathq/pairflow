@@ -1,5 +1,6 @@
 //! Tray and status window. Closing the window leaves Pairflow running.
 
+use crate::update::{self, ApplyPlan};
 use crate::{run_host, run_join, UiEvent};
 use eframe::egui;
 use pairflow_core::{Identity, LaunchAction};
@@ -56,6 +57,10 @@ enum TrayCmd {
     Host,
     Join,
     Disconnect,
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+    CheckUpdate,
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+    InstallUpdate,
     Quit,
 }
 
@@ -80,6 +85,9 @@ pub fn run() -> Result<(), String> {
         tray_rx,
         tray,
         scale: 1.0,
+        pending_version: None,
+        update_note: String::new(),
+        update_busy: false,
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -103,6 +111,9 @@ struct PairflowApp {
     tray_rx: Receiver<TrayCmd>,
     tray: Tray,
     scale: f32,
+    pending_version: Option<String>,
+    update_note: String,
+    update_busy: bool,
 }
 
 impl PairflowApp {
@@ -127,6 +138,7 @@ impl PairflowApp {
             Err(err) => self.status = err.to_string(),
         }
         self.refresh_tray();
+        self.check_update(false);
     }
 
     fn start_host(&mut self) {
@@ -202,6 +214,18 @@ impl PairflowApp {
                     self.detail = "Session stopped.".into();
                 }
             }
+            UiEvent::UpdateReady { version } => {
+                self.pending_version = Some(version.clone());
+                self.update_note = format!("Update {version} is available.");
+                self.update_busy = false;
+            }
+            UiEvent::UpdateNote(text) => {
+                self.update_note = text;
+            }
+            UiEvent::UpdateIdle => {
+                self.update_busy = false;
+            }
+            UiEvent::UpdateStaged => {}
         }
         self.refresh_tray();
     }
@@ -212,7 +236,84 @@ impl PairflowApp {
         } else {
             String::new()
         };
-        self.tray.update(&self.status, &code);
+        let install = self
+            .pending_version
+            .as_ref()
+            .map(|version| format!("Install {version}"));
+        self.tray.update(&self.status, &code, install.as_deref());
+    }
+
+    fn check_update(&mut self, manual: bool) {
+        if !update::supported() || self.update_busy {
+            return;
+        }
+        self.update_busy = true;
+        if manual {
+            self.update_note = "Checking GitHub releases…".into();
+        }
+        std::thread::spawn(move || {
+            let current = env!("CARGO_PKG_VERSION");
+            match update::check(current) {
+                Ok(Some(asset)) => {
+                    let version = asset.version.clone();
+                    update::store_pending(asset);
+                    crate::feedback::emit(UiEvent::UpdateReady { version });
+                }
+                Ok(None) => {
+                    update::clear_pending();
+                    if manual {
+                        crate::feedback::emit(UiEvent::UpdateNote(format!(
+                            "Pairflow {current} is up to date."
+                        )));
+                    }
+                    crate::feedback::emit(UiEvent::UpdateIdle);
+                }
+                Err(err) => {
+                    if manual {
+                        crate::feedback::emit(UiEvent::UpdateNote(format!(
+                            "Update check failed: {err}"
+                        )));
+                    }
+                    crate::feedback::emit(UiEvent::UpdateIdle);
+                }
+            }
+        });
+    }
+
+    fn install_update(&mut self) {
+        if !update::supported() || self.update_busy || self.pending_version.is_none() {
+            return;
+        }
+        self.update_busy = true;
+        self.update_note = "Downloading update…".into();
+        std::thread::spawn(|| match update::stage_pending() {
+            Ok(_) => crate::feedback::emit(UiEvent::UpdateStaged),
+            Err(err) => {
+                crate::feedback::emit(UiEvent::UpdateNote(err));
+                crate::feedback::emit(UiEvent::UpdateIdle);
+            }
+        });
+    }
+
+    fn apply_staged(&mut self) {
+        match update::launch_staged() {
+            Ok(ApplyPlan::Replace) => {
+                disconnect();
+                self.update_note = replace_note();
+                self.refresh_tray();
+                std::thread::sleep(Duration::from_millis(200));
+                std::process::exit(0);
+            }
+            Ok(ApplyPlan::OpenedDisk) => {
+                self.update_busy = false;
+                self.update_note = "Opened the update disk image. Drag Pairflow to Applications, then Control-click it and choose Open. An unsigned build may ask for that again.".into();
+            }
+            Err(err) => {
+                self.update_busy = false;
+                self.update_note = err;
+            }
+        }
+        self.refresh_tray();
     }
 
     fn handle_tray(&mut self, ctx: &egui::Context, cmd: TrayCmd) {
@@ -233,6 +334,8 @@ impl PairflowApp {
                 self.detail = "The saved code is kept for the next launch.".into();
                 self.refresh_tray();
             }
+            TrayCmd::CheckUpdate => self.check_update(true),
+            TrayCmd::InstallUpdate => self.install_update(),
             TrayCmd::Quit => {
                 disconnect();
                 std::thread::sleep(Duration::from_millis(150));
@@ -248,7 +351,11 @@ impl eframe::App for PairflowApp {
             self.boot();
         }
         while let Ok(ev) = self.ui_rx.try_recv() {
+            let staged = matches!(ev, UiEvent::UpdateStaged);
             self.apply_ui(ev);
+            if staged {
+                self.apply_staged();
+            }
         }
         while let Ok(cmd) = self.tray_rx.try_recv() {
             self.handle_tray(ctx, cmd);
@@ -302,11 +409,43 @@ impl eframe::App for PairflowApp {
                 }
             });
             ui.add_space(12.0);
+            if update::supported() {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Check for updates").clicked() {
+                        self.check_update(true);
+                    }
+                    if let Some(version) = &self.pending_version {
+                        if ui.button(format!("Install {version}")).clicked() {
+                            self.install_update();
+                        }
+                    }
+                });
+                if !self.update_note.is_empty() {
+                    ui.label(&self.update_note);
+                }
+            }
+            ui.add_space(12.0);
             ui.label("Closing this window keeps Pairflow in the tray. Quit exits.");
             ui.label(
-                "The peer sits on the outer right of the Windows desktop. The guest pointer covers every monitor on this computer.",
+                "The peer sits on the outer right of the Windows desktop. On a Mac guest the pointer is placed on the full desktop, every display included.",
             );
         });
+    }
+}
+
+fn replace_note() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        "Installing the update. Pairflow will reopen. Windows SmartScreen may ask again because the build is unsigned.".into()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "Installing the update. Pairflow will reopen. If macOS blocks it, Control-click Pairflow and choose Open.".into()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        "Installing the update.".into()
     }
 }
 
@@ -321,7 +460,7 @@ impl Tray {
     fn install(tx: Sender<TrayCmd>) -> Result<Self, String> {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            let icon = native_tray(tx, "Pairflow", "")?;
+            let icon = native_tray(tx, "Pairflow", "", None)?;
             Ok(Self { icon })
         }
         #[cfg(target_os = "linux")]
@@ -347,16 +486,17 @@ impl Tray {
         }
     }
 
-    fn update(&mut self, status: &str, code: &str) {
+    fn update(&mut self, status: &str, code: &str, install: Option<&str>) {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            if let Ok(menu) = tray_menu(status, code) {
+            if let Ok(menu) = tray_menu(status, code, install) {
                 self.icon.set_menu(Some(Box::new(menu)));
             }
             let _ = self.icon.set_tooltip(Some(format!("Pairflow — {status}")));
         }
         #[cfg(target_os = "linux")]
         {
+            let _ = install;
             let status = status.to_string();
             let code = code.to_string();
             self.handle.update(move |tray| {
@@ -372,8 +512,9 @@ fn native_tray(
     tx: Sender<TrayCmd>,
     status: &str,
     code: &str,
+    install: Option<&str>,
 ) -> Result<tray_icon::TrayIcon, String> {
-    let menu = tray_menu(status, code)?;
+    let menu = tray_menu(status, code, install)?;
     let icon = tray_icon::TrayIconBuilder::new()
         .with_tooltip(format!("Pairflow — {status}"))
         .with_menu(Box::new(menu))
@@ -389,6 +530,8 @@ fn native_tray(
                 "host" => TrayCmd::Host,
                 "join" => TrayCmd::Join,
                 "disconnect" => TrayCmd::Disconnect,
+                "update" => TrayCmd::CheckUpdate,
+                "install" => TrayCmd::InstallUpdate,
                 "quit" => TrayCmd::Quit,
                 _ => continue,
             };
@@ -401,7 +544,11 @@ fn native_tray(
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn tray_menu(status: &str, code: &str) -> Result<tray_icon::menu::Menu, String> {
+fn tray_menu(
+    status: &str,
+    code: &str,
+    install: Option<&str>,
+) -> Result<tray_icon::menu::Menu, String> {
     use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
     let menu = Menu::new();
     let status_item = MenuItem::with_id("status", status, false, None);
@@ -409,6 +556,7 @@ fn tray_menu(status: &str, code: &str) -> Result<tray_icon::menu::Menu, String> 
     let host = MenuItem::with_id("host", "Host", true, None);
     let join = MenuItem::with_id("join", "Join…", true, None);
     let disconnect = MenuItem::with_id("disconnect", "Disconnect", true, None);
+    let check = MenuItem::with_id("update", "Check for updates", true, None);
     let quit = MenuItem::with_id("quit", "Quit", true, None);
     menu.append(&status_item).map_err(|e| e.to_string())?;
     if !code.is_empty() {
@@ -421,6 +569,13 @@ fn tray_menu(status: &str, code: &str) -> Result<tray_icon::menu::Menu, String> 
     menu.append(&host).map_err(|e| e.to_string())?;
     menu.append(&join).map_err(|e| e.to_string())?;
     menu.append(&disconnect).map_err(|e| e.to_string())?;
+    menu.append(&PredefinedMenuItem::separator())
+        .map_err(|e| e.to_string())?;
+    menu.append(&check).map_err(|e| e.to_string())?;
+    if let Some(label) = install {
+        let install_item = MenuItem::with_id("install", label, true, None);
+        menu.append(&install_item).map_err(|e| e.to_string())?;
+    }
     menu.append(&quit).map_err(|e| e.to_string())?;
     Ok(menu)
 }

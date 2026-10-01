@@ -13,9 +13,10 @@ use core_graphics::event::{
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use foreign_types::ForeignType;
 use pairflow_core::union_desktop;
 use pairflow_proto::{InputEvent, KeyId, MouseButton};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
@@ -24,6 +25,15 @@ use std::time::Duration;
 static EXCLUSIVE: AtomicBool = AtomicBool::new(false);
 static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
 static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
+/// Buttons we have injected, so a drag keeps the matching dragged event type.
+static BUTTONS: AtomicU8 = AtomicU8::new(0);
+const BTN_LEFT: u8 = 1;
+const BTN_RIGHT: u8 = 2;
+const BTN_MIDDLE: u8 = 4;
+/// `kCGEventSourceUserData`. Events we post carry [`PAIRFLOW_MARK`] so the tap
+/// does not treat them as a physical mouse and warp them back.
+const EVENT_SOURCE_USER_DATA: u32 = 42;
+const PAIRFLOW_MARK: i64 = 0x5046_0001;
 static LAST_FLAGS: AtomicU64 = AtomicU64::new(0);
 static STOP: AtomicBool = AtomicBool::new(false);
 static TAP_DISABLED: AtomicBool = AtomicBool::new(false);
@@ -39,13 +49,11 @@ const CONTROL: u64 = 0x0004_0000;
 const ALTERNATE: u64 = 0x0008_0000;
 const COMMAND: u64 = 0x0010_0000;
 
-/// Union of every active display in Quartz global points.
+/// Union of every active display in Quartz global points, plus a log of each one.
 ///
-/// `CGDisplay::pixels_wide` is the framebuffer size. Mouse warps and event
-/// locations use points (`bounds`), and a display to the left of the main
-/// panel has a negative origin. Measuring only the main display in pixels
-/// confined the guest cursor to a box on one screen.
-fn desktop_points() -> (i32, i32, i32, i32) {
+/// `CGDisplay::pixels_wide` is the framebuffer size. Mouse locations use points
+/// (`bounds`), and a display to the left of the main panel has a negative origin.
+fn desktop_points() -> (i32, i32, i32, i32, String) {
     let mut rects = Vec::new();
     if let Ok(ids) = CGDisplay::active_displays() {
         for id in ids {
@@ -62,20 +70,24 @@ fn desktop_points() -> (i32, i32, i32, i32) {
             }
         }
     }
-    if let Some(desktop) = union_desktop(&rects) {
-        return desktop;
+    let note = rects
+        .iter()
+        .map(|(x, y, w, h)| format!("({x},{y} {w}x{h})"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some((x, y, w, h)) = union_desktop(&rects) {
+        return (x, y, w, h, note);
     }
     let bounds = CGDisplay::main().bounds();
-    (
-        bounds.origin.x.round() as i32,
-        bounds.origin.y.round() as i32,
-        (bounds.size.width.round() as i32).max(2),
-        (bounds.size.height.round() as i32).max(2),
-    )
+    let w = (bounds.size.width.round() as i32).max(2);
+    let h = (bounds.size.height.round() as i32).max(2);
+    let x = bounds.origin.x.round() as i32;
+    let y = bounds.origin.y.round() as i32;
+    (x, y, w, h, format!("({x},{y} {w}x{h})"))
 }
 
 pub fn open() -> Result<Input, InputError> {
-    let (origin_x, origin_y, width, height) = desktop_points();
+    let (origin_x, origin_y, width, height, geometry) = desktop_points();
     let (event_tx, event_rx) = sync_channel(1024);
     {
         TX.lock().unwrap().tx = Some(event_tx.clone());
@@ -92,7 +104,7 @@ pub fn open() -> Result<Input, InputError> {
             ))
         }
     }
-    Ok(Input::from_channel(
+    let mut input = Input::from_channel(
         origin_x,
         origin_y,
         width,
@@ -102,7 +114,9 @@ pub fn open() -> Result<Input, InputError> {
         Box::new(MacOps {
             join: Mutex::new(Some(join)),
         }),
-    ))
+    );
+    input.geometry = geometry;
+    Ok(input)
 }
 
 struct MacOps {
@@ -118,7 +132,12 @@ impl Platform for MacOps {
     fn warp(&self, x: i32, y: i32) {
         ANCHOR_X.store(x, Ordering::Relaxed);
         ANCHOR_Y.store(y, Ordering::Relaxed);
-        let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x as f64, y as f64));
+        // Guest placement. CGWarpMouseCursorPosition is the wrong call here:
+        // on a multi-display Mac it confines the visible cursor to a rectangle
+        // the size of the main display, so an external screen only shows a box
+        // and the built-in panel stays unreachable. An absolute mouse-moved
+        // event is what actually crosses displays.
+        place_pointer(x, y);
     }
     fn set_exclusive(&self, on: bool) {
         if on {
@@ -201,6 +220,9 @@ fn on_event(ty: CGEventType, event: &CGEvent) -> CallbackResult {
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
     ) {
         TAP_DISABLED.store(true, Ordering::Relaxed);
+        return CallbackResult::Keep;
+    }
+    if event.get_integer_value_field(EVENT_SOURCE_USER_DATA) == PAIRFLOW_MARK {
         return CallbackResult::Keep;
     }
     let exclusive = EXCLUSIVE.load(Ordering::Relaxed);
@@ -332,8 +354,91 @@ fn source() -> Result<CGEventSource, ()> {
     CGEventSource::new(CGEventSourceStateID::HIDSystemState)
 }
 
+/// Session state, not the HID system state. This is the source Qt uses when
+/// `CGWarpMouseCursorPosition` refuses to leave the main display.
+fn place_source() -> Result<CGEventSource, ()> {
+    CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+}
+
+/// Move the cursor to a global display point, including a point on another display.
+///
+/// `CGWarpMouseCursorPosition` clamps to a box the size of the main display
+/// (Qt and others document the same failure). Posting `kCGEventMouseMoved`
+/// at the absolute point, with deltas forced to 0, is the placement WindowServer
+/// will apply on every display. A non-zero delta is clipped to the display
+/// currently under the cursor, which is the box the guest was stuck in.
+fn place_pointer(x: i32, y: i32) {
+    let Ok(source) = place_source() else {
+        return;
+    };
+    silence_suppression(&source);
+    let point = CGPoint::new(x as f64, y as f64);
+    let kind = drag_or_move();
+    let Ok(event) = CGEvent::new_mouse_event(
+        source,
+        kind,
+        point,
+        core_graphics::event::CGMouseButton::Left,
+    ) else {
+        return;
+    };
+    event.set_location(point);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, 0);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, 0);
+    event.set_double_value_field(EventField::MOUSE_EVENT_DELTA_X, 0.0);
+    event.set_double_value_field(EventField::MOUSE_EVENT_DELTA_Y, 0.0);
+    event.set_integer_value_field(EVENT_SOURCE_USER_DATA, PAIRFLOW_MARK);
+    event.post(CGEventTapLocation::HID);
+    let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
+}
+
+fn drag_or_move() -> CGEventType {
+    let buttons = BUTTONS.load(Ordering::Relaxed);
+    if buttons & BTN_LEFT != 0 {
+        CGEventType::LeftMouseDragged
+    } else if buttons & BTN_RIGHT != 0 {
+        CGEventType::RightMouseDragged
+    } else if buttons & BTN_MIDDLE != 0 {
+        CGEventType::OtherMouseDragged
+    } else {
+        CGEventType::MouseMoved
+    }
+}
+
+fn silence_suppression(source: &CGEventSource) {
+    unsafe {
+        CGEventSourceSetLocalEventsSuppressionInterval(source.as_ptr(), 0.0);
+    }
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceSetLocalEventsSuppressionInterval(
+        source: *mut core_graphics::sys::CGEventSource,
+        seconds: f64,
+    );
+}
+
+fn mark(event: &CGEvent) {
+    event.set_integer_value_field(EVENT_SOURCE_USER_DATA, PAIRFLOW_MARK);
+}
+
+fn note_button(button: MouseButton, down: bool) {
+    let bit = match button {
+        MouseButton::Left => BTN_LEFT,
+        MouseButton::Right => BTN_RIGHT,
+        MouseButton::Middle => BTN_MIDDLE,
+    };
+    if down {
+        BUTTONS.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        BUTTONS.fetch_and(!bit, Ordering::Relaxed);
+    }
+}
+
 fn inject_event(ev: &InputEvent) -> Result<(), String> {
     let source = source().map_err(|_| "CGEventSource".to_string())?;
+    silence_suppression(&source);
     match ev {
         InputEvent::MouseMove { dx, dy } | InputEvent::PointerAt { x: dx, y: dy } => {
             let (x, y) = if matches!(ev, InputEvent::PointerAt { .. }) {
@@ -342,14 +447,7 @@ fn inject_event(ev: &InputEvent) -> Result<(), String> {
                 let (x, y) = current_pointer().unwrap_or((0, 0));
                 (x + dx, y + dy)
             };
-            let event = CGEvent::new_mouse_event(
-                source,
-                CGEventType::MouseMoved,
-                CGPoint::new(x as f64, y as f64),
-                core_graphics::event::CGMouseButton::Left,
-            )
-            .map_err(|_| "mouse event".to_string())?;
-            event.post(CGEventTapLocation::HID);
+            place_pointer(x, y);
         }
         InputEvent::MouseButton { button, down } => {
             let (x, y) = current_pointer().unwrap_or((0, 0));
@@ -382,11 +480,14 @@ fn inject_event(ev: &InputEvent) -> Result<(), String> {
             let event =
                 CGEvent::new_mouse_event(source, ty, CGPoint::new(x as f64, y as f64), which)
                     .map_err(|_| "button event".to_string())?;
+            note_button(*button, *down);
+            mark(&event);
             event.post(CGEventTapLocation::HID);
         }
         InputEvent::Wheel { dx, dy } => {
             let event = CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, *dy, *dx, 0)
                 .map_err(|_| "scroll event".to_string())?;
+            mark(&event);
             event.post(CGEventTapLocation::HID);
         }
         InputEvent::Key { key, down } => {
@@ -395,6 +496,7 @@ fn inject_event(ev: &InputEvent) -> Result<(), String> {
             };
             let event = CGEvent::new_keyboard_event(source, code, *down)
                 .map_err(|_| "key event".to_string())?;
+            mark(&event);
             event.post(CGEventTapLocation::HID);
         }
     }
