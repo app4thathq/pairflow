@@ -7,7 +7,8 @@ use crate::gate::{hit_edge, inset_point, RemoteCursor, Screen};
 use pairflow_proto::{InputEvent, KeyId, SecureMsg, Side};
 use std::collections::BTreeSet;
 
-const EDGE_MARGIN: i32 = 2;
+/// Wide enough that a few pixels of DPI or monitor-rect disagreement still counts.
+const EDGE_MARGIN: i32 = 32;
 const EDGE_INSET: i32 = 24;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +82,13 @@ impl HostShare {
         }
     }
 
+    /// Last cursor sample and whether it is inside the peer-edge margin.
+    pub fn cursor_debug(&self) -> Option<(i32, i32, bool)> {
+        let (x, y) = self.pos?;
+        let hit = hit_edge(self.screen, x, y, self.peer_side, EDGE_MARGIN).is_some();
+        Some((x, y, hit))
+    }
+
     pub fn on_net(&mut self, msg: SecureMsg) -> Vec<HostEffect> {
         match msg {
             SecureMsg::Leave { frac, .. } if self.remote => self.leave(frac, false),
@@ -118,11 +126,20 @@ impl HostShare {
                 self.mods.remove(&key);
             }
         }
-        if down && key == KeyId::F12 && self.ctrl_down() && self.alt_down() {
+        if down && self.ctrl_down() && self.alt_down() && key == KeyId::F12 {
             return if self.remote {
                 self.leave(5_000, true)
             } else {
                 Vec::new()
+            };
+        }
+        // Geometry-independent workaround: same enter path as a real edge hit.
+        if down && self.ctrl_down() && self.alt_down() && matches!(key, KeyId::Enter | KeyId::Right)
+        {
+            return if self.remote {
+                Vec::new()
+            } else {
+                self.enter(5_000)
             };
         }
         if self.remote {
@@ -321,9 +338,9 @@ mod tests {
         assert!(host
             .on_input(InputEvent::MouseMove { dx: 4000, dy: 0 })
             .is_empty());
-        host.on_input(InputEvent::PointerAt { x: 1900, y: 200 });
+        host.on_input(InputEvent::PointerAt { x: 1700, y: 200 });
         assert!(!host.remote);
-        let fx = host.on_input(InputEvent::MouseMove { dx: 30, dy: 0 });
+        let fx = host.on_input(InputEvent::MouseMove { dx: 220, dy: 0 });
         assert!(host.remote);
         assert!(fx.iter().any(|e| matches!(
             e,
@@ -358,6 +375,45 @@ mod tests {
             "x=1900 is still on the first of two 1920-wide monitors"
         );
         host.on_input(InputEvent::PointerAt { x: 3839, y: 100 });
+        assert!(host.remote);
+    }
+
+    #[test]
+    fn ctrl_alt_enter_forces_the_same_enter_path() {
+        let mut host = HostShare::new(Screen::new(1920, 1080), Side::Right);
+        host.on_input(InputEvent::Key {
+            key: KeyId::LeftControl,
+            down: true,
+        });
+        host.on_input(InputEvent::Key {
+            key: KeyId::LeftAlt,
+            down: true,
+        });
+        let fx = host.on_input(InputEvent::Key {
+            key: KeyId::Enter,
+            down: true,
+        });
+        assert!(host.remote);
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            HostEffect::Send(SecureMsg::Enter {
+                edge: Side::Left,
+                ..
+            })
+        )));
+        assert!(fx
+            .iter()
+            .any(|e| matches!(e, HostEffect::SetExclusive(true))));
+    }
+
+    #[test]
+    fn cursor_debug_reports_whether_the_right_edge_would_fire() {
+        let mut host = HostShare::new(Screen::new(1920, 1080), Side::Right);
+        assert!(host.cursor_debug().is_none());
+        host.on_input(InputEvent::PointerAt { x: 100, y: 10 });
+        assert_eq!(host.cursor_debug(), Some((100, 10, false)));
+        host.on_input(InputEvent::PointerAt { x: 1890, y: 10 });
+        assert_eq!(host.cursor_debug(), Some((1890, 10, true)));
         assert!(host.remote);
     }
 

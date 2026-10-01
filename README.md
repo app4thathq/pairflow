@@ -60,7 +60,8 @@ terminal are unchanged.
 The peer is to the **right** of the host by default. Put it on another edge
 with `pairflow host --side left` (also `top` or `bottom`). Move the pointer
 through that edge. Keys follow the pointer. `Ctrl+Alt+F12` on the host returns
-the pointer and releases modifiers on the peer.
+the pointer and releases modifiers on the peer. `Ctrl+Alt+Enter` or
+`Ctrl+Alt+Right` forces the same crossing as pushing through the edge.
 
 The host remembers the code in the per-user state file, so the next `pairflow
 host` shows the same code and a client can reconnect after an IP change.
@@ -84,6 +85,7 @@ Useful flags:
 | `--direct HOST:PORT` | Join without mDNS or UDP. |
 | `--new-code`, `--code K7NQ2` | Rotate or set the host code. |
 | `--dry-run` | Do not capture real devices. Drive the pointer from stdin. |
+| `--debug` | On the host, print the cursor whenever it changes. |
 | `--no-mdns`, `--no-udp` | Turn off one discovery channel. |
 
 On the host, stdin can drive the pointer. That is how `--dry-run` works, and
@@ -118,17 +120,24 @@ networks so TCP `24816` and UDP `24817` work.
 The other computer sits on the **outer** edge of the whole Windows desktop.
 With two monitors side by side and `--side right`, push the pointer off the
 right side of the right-hand monitor. The seam between the two Windows
-monitors stays on Windows. Pairflow turns on per-monitor DPI awareness so that
-edge is the same pixel the cursor uses. The host prints `pointer is on the
-other computer` when the crossing succeeds. If that line appears and the Mac
-still does not move, grant Accessibility and Input Monitoring to Pairflow on
-the Mac.
+monitors stays on Windows. The executable's manifest is per-monitor DPI aware,
+and the hook thread measures the desktop in that same coordinate space as
+`GetCursorPos`. Within 32 pixels of that outer edge, Pairflow claims the
+pointer. The host banner prints the version, whether Windows hooks are
+actually active, and the desktop rectangle. After pairing it prints the cursor
+every 2 seconds (`--debug` prints it as it changes). `edge=true` is the same
+test that crosses. The host prints `pointer is on the other computer` when
+the crossing succeeds. If capture cannot start, the host stops with an error
+instead of quietly ignoring the mouse. If that line appears and the Mac still
+does not move, grant Accessibility and Input Monitoring to Pairflow on the
+Mac. `Ctrl+Alt+Enter` crosses even when the edge geometry is still wrong.
 
 **Linux.** An X11 session is required (`DISPLAY` must be set). Wayland is not
 supported yet; XWayland sometimes works, and grabs there are best-effort. The
 XTest extension must be enabled, which it is on ordinary X.Org. If capture
-cannot start, Pairflow says so and falls back to `--dry-run`. Allow TCP
-`24816` and UDP `24817` on the local network.
+cannot start, the host stops and says why. `--dry-run` is the explicit way to
+drive the pointer from stdin. Allow TCP `24816` and UDP `24817` on the local
+network.
 
 ## Build from source
 
@@ -163,8 +172,14 @@ packaging/macos/build-dmg.sh dist/pairflow
 # dist/pairflow-macos.dmg
 ```
 
-Windows: `cargo build --release` produces `target\release\pairflow.exe`. Copy
-it anywhere and run it. That file is the installable artifact CI uploads.
+Windows: `cargo build --release` produces `target\release\pairflow.exe`.
+Then embed the DPI manifest (CI does this for the uploaded exe):
+
+```powershell
+packaging/windows/embed-manifest.ps1
+```
+
+Copy the exe anywhere and run it. That file is the installable artifact CI uploads.
 
 ## Layout
 

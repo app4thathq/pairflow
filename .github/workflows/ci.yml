@@ -46,6 +46,9 @@ jobs:
         run: cargo test --workspace --locked
       - name: Build release binary
         run: cargo build --release --locked
+      - name: Embed per-monitor DPI manifest
+        shell: pwsh
+        run: packaging/windows/embed-manifest.ps1
       - name: Stage portable executable
         shell: pwsh
         run: |
