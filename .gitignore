@@ -1,0 +1,12 @@
+/target
+/dist
+**/*.rs.bk
+.DS_Store
+*.AppImage
+*.dmg
+*.exe
+packaging/linux/AppDir
+packaging/macos/stage
+.idea
+.vscode
+*.swp

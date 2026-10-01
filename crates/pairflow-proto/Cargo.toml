@@ -1,0 +1,11 @@
+[package]
+name = "pairflow-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire protocol, key ids, and pairing-code alphabet for Pairflow"
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true

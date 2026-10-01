@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Pairflow
+Comment=Share a keyboard and mouse with a 5-character code
+Exec=pairflow
+Icon=pairflow
+Terminal=true
+Type=Application
+Categories=Utility;Network;
+StartupNotify=false

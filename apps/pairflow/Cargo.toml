@@ -1,0 +1,19 @@
+[package]
+name = "pairflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Share a keyboard and mouse across computers with a 5-character code"
+rust-version.workspace = true
+
+[[bin]]
+name = "pairflow"
+path = "src/main.rs"
+
+[dependencies]
+pairflow-proto.workspace = true
+pairflow-core.workspace = true
+pairflow-input.workspace = true
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"

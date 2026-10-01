@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  linux:
+    name: Linux AppImage
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Package AppImage
+        run: packaging/linux/build-appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pairflow-linux-x86_64
+          path: dist/pairflow-linux-x86_64.AppImage
+          if-no-files-found: error
+
+  windows:
+    name: Windows exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Stage portable executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/pairflow.exe dist/pairflow-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pairflow-windows-x86_64
+          path: dist/pairflow-windows-x86_64.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS dmg
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build universal binary
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/pairflow \
+            target/aarch64-apple-darwin/release/pairflow \
+            target/x86_64-apple-darwin/release/pairflow
+      - name: Package disk image
+        run: packaging/macos/build-dmg.sh dist/pairflow
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pairflow-macos
+          path: dist/pairflow-macos.dmg
+          if-no-files-found: error
+
+  release:
+    name: Draft GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            artifacts/pairflow-linux-x86_64/*
+            artifacts/pairflow-windows-x86_64/*
+            artifacts/pairflow-macos/*

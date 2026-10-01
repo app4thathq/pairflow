@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pairflow-proto",
+    "crates/pairflow-core",
+    "crates/pairflow-input",
+    "apps/pairflow",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/app4thathq/pairflow"
+rust-version = "1.85"
+
+[workspace.dependencies]
+pairflow-proto = { path = "crates/pairflow-proto" }
+pairflow-core = { path = "crates/pairflow-core" }
+pairflow-input = { path = "crates/pairflow-input" }
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
