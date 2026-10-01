@@ -26,6 +26,14 @@ System Settings → Privacy & Security → Accessibility → enable Pairflow.
 The guest pointer covers every display on this Mac, including a screen that
 sits to the left of the built-in panel.
 
+Updates
+-------
+
+Check for updates in the menu bar or the status window. Install downloads
+the newer disk image from the public GitHub release and replaces this app.
+The build is unsigned, so after an update macOS may ask you to Control-click
+Pairflow and choose Open again.
+
 Terminal use
 ------------
 

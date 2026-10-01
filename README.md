@@ -36,6 +36,25 @@ MSI. The AppImage is built on Ubuntu 22.04. The tray app links the desktop
 libraries already present on a normal Ubuntu session (`libdbus-1`, `libX11`,
 `libGL`, `libxkbcommon`).
 
+## Updates
+
+The Windows and macOS tray apps check
+<https://github.com/app4thathq/pairflow/releases> on launch and from
+**Check for updates**. The check uses the public GitHub API and does not need
+a token. A failed or offline check stays quiet unless you asked for it.
+Nothing downloads until you choose **Install**.
+
+- **Windows.** Pairflow downloads `pairflow-windows-x86_64.exe`, exits, and a
+  small PowerShell helper copies it over the running file and starts it again.
+  SmartScreen may prompt again because the executable is unsigned.
+- **macOS.** When Pairflow is running from `Pairflow.app`, it downloads
+  `pairflow-macos.dmg`, replaces that app, clears the quarantine flag, and
+  reopens it. An unsigned update can still be blocked: Control-click Pairflow
+  and choose Open, then Open again. If you started a loose binary instead of
+  the app, Install opens the disk image so you can drag Pairflow into place.
+- **Linux.** There is no in-app AppImage installer. Download the new image
+  from the release page.
+
 ## Pair
 
 Double-click Pairflow. It sits in the tray: the Windows notification area,
@@ -48,6 +67,9 @@ the macOS menu bar, or the Linux status icon.
   keeps running.
 - **Disconnect** stops the session and keeps the saved code.
 - **Quit** exits.
+- **Check for updates** (Windows and macOS) looks at the public GitHub Releases
+  page. **Install** appears when a newer version is published. Nothing is
+  replaced until you choose Install.
 
 The next time the guest opens Pairflow, it starts joining that saved code in
 the background. The tray says `Reconnecting to K7NQ2…`, then `Paired with …`.
@@ -92,8 +114,9 @@ Once the pointer has crossed, it can reach every pixel of every monitor on
 the guest, not only the primary display. Pairflow measures the guest desktop
 in the same coordinate space the OS uses for the pointer. On macOS that is
 the union of the active displays in Quartz points. A display to the left of
-the built-in panel has a negative origin and is included. The join log prints
-the rectangle, for example `guest desktop: 4072x1440 at (-2560,0)`.
+the built-in panel has a negative origin and is included. The status window
+and the join log both show the rectangle and each display, for example
+`guest desktop: 4072x1440 at (-2560,0). displays: (-2560,0 2560x1440) (0,80 1512x982)`.
 
 A typical desk, left to right, is the Windows laptop, the Windows external
 screen, the guest's external screen, then the Mac. Leave Windows through the
@@ -102,10 +125,13 @@ of its own desktop and can move across the external screen onto the Mac.
 
 Remote motion follows the host cursor. Pairflow sums the host's pointer
 deltas (on Windows those already include the system's mouse acceleration) and
-places the guest cursor with an absolute warp, so a fast swipe is not dropped
-and macOS does not clamp the move to a single display. `--sensitivity 1.0`
-(the default) keeps that 1:1 travel. `pairflow join --sensitivity 1.5` scales
-it and is remembered. The useful range is `0.1` to `8`.
+places the guest cursor at that absolute point. On macOS the placement is a
+mouse-moved event with the deltas forced to zero. `CGWarpMouseCursorPosition`
+is not used for this: it confines the cursor to a box the size of the main
+display, which on a wide external screen looks like a rectangle covering
+roughly the left portion of that screen and never reaches the built-in panel.
+`--sensitivity 1.0` (the default) keeps 1:1 travel. `pairflow join --sensitivity 1.5`
+scales it and is remembered. The useful range is `0.1` to `8`.
 
 If multicast and broadcast are blocked:
 

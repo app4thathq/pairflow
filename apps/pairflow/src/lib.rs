@@ -24,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod feedback;
 pub mod gui_app;
+pub mod update;
 pub use feedback::{set_sink, UiEvent};
 
 #[derive(Parser)]
@@ -424,10 +425,19 @@ pub fn run_join(
         eprintln!();
     }
     let screen = Screen::with_origin(input.origin_x, input.origin_y, input.width, input.height);
-    println!(
-        "guest desktop: {}x{} at ({},{}). pointer scale {scale}",
-        screen.width, screen.height, screen.x, screen.y
-    );
+    let desktop = if input.geometry.is_empty() {
+        format!(
+            "guest desktop: {}x{} at ({},{}). pointer scale {scale}",
+            screen.width, screen.height, screen.x, screen.y
+        )
+    } else {
+        format!(
+            "guest desktop: {}x{} at ({},{}). displays: {}. pointer scale {scale}",
+            screen.width, screen.height, screen.x, screen.y, input.geometry
+        )
+    };
+    println!("{desktop}");
+    feedback::emit(UiEvent::Message(desktop));
     spawn_stdin(input.emitter(), screen, None, running.clone());
     println!("joining with code {code}");
     feedback::emit(UiEvent::Joining { code: code.clone() });

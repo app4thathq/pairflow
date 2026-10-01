@@ -181,10 +181,12 @@ forwarded. Exclusive capture sums those deltas in the process instead of
 dropping them when the event channel is full, because a dropped delta is
 travel the cursor never gets back (the host warps its own pointer to an
 anchor). The client adds the summed delta, scaled by sensitivity (default
-1.0, clamped to 0.1–8), to a cursor clamped to the guest desktop, then warps
-to that absolute point. A relative inject would be clamped by the OS to the
-display currently under the cursor, which both confined the pointer to one
-monitor and threw away the rest of the swipe. If a delta would cross back
+1.0, clamped to 0.1–8), to a cursor clamped to the guest desktop, then places
+the cursor at that absolute point. A relative inject would be clamped by the
+OS to the display currently under the cursor, which both confined the pointer
+to one monitor and threw away the rest of the swipe. On macOS that absolute
+point is posted as a mouse-moved event; see the macOS section for why a warp
+is the wrong call. If a delta would cross back
 over the entry edge, the client sends `Leave` with the new fraction. The host
 drops the grab and warps its cursor 24 pixels inside the same edge.
 
@@ -194,7 +196,8 @@ points, not the pixel size of the main display. Enter from the host's right
 edge arrives on the guest's left, which is the external screen when that
 screen sits to the left of the Mac panel. Empty pixels between displays of
 different heights are inside the bounding rectangle; they are not a separate
-layout. The join log prints `guest desktop: WxH at (x,y)`.
+layout. The join log and the tray status line print
+`guest desktop: WxH at (x,y)` plus each display rectangle.
 
 `Ctrl+Alt+F12` on the host forces the same return and releases modifiers on
 the client so they do not stick. `Ctrl+Alt+Enter` and `Ctrl+Alt+Right` force
@@ -276,11 +279,27 @@ console binary. Both get the DPI manifest. No MSI.
 
 A `CGEventTap` at the HID insertion point watches mouse, key, scroll, and
 flag-changed events. Returning `CallbackResult::Drop` swallows them while the
-pointer is remote. `CGDisplay::warp_mouse_cursor_position` parks the cursor
-without generating a new event. The guest desktop is the union of
-`CGDisplay::active_displays()` bounds in points. Injection posts `CGEvent`s
-for buttons, line-based scroll, and virtual keycodes, and warps to the
-absolute pointer position so a move can leave the display under the cursor.
+pointer is remote. While this Mac is the host, `CGWarpMouseCursorPosition`
+parks the cursor on the anchor without generating a new event. That call is
+only safe for a point the cursor already occupies.
+
+Guest placement does not use it. `CGWarpMouseCursorPosition` confines the
+visible cursor to a rectangle the size of the main display, even when the
+logical desktop is the union of every `CGDisplay` bounds in points. With the
+external screen to the left of the built-in panel, that box sits on the
+external (about 40% of a wide panel) and the built-in display stays
+unreachable. v0.2.0 already measured the union correctly; the warp was the
+clamp. Placement posts `kCGEventMouseMoved` (or the matching dragged type)
+at the absolute global point, with integer and double deltas forced to 0, on
+a session event source whose suppression interval is 0. A non-zero delta is
+clipped to the display under the cursor, which is the same box. The event is
+marked with `kCGEventSourceUserData` so the tap keeps it and does not treat
+it as physical motion. `CGAssociateMouseAndMouseCursorPosition(true)` follows
+the post. Injected buttons, scroll, and keys are marked the same way.
+
+The guest desktop is the union of `CGDisplay::active_displays()` bounds in
+points. Injection posts `CGEvent`s for buttons, line-based scroll, and
+virtual keycodes.
 
 **Permission.** `CGEventTapCreate` fails unless the process is trusted for
 Accessibility. An `.app` bundle is what System Settings lists, and the bundle
@@ -297,6 +316,27 @@ backend diffs the flag word and emits the logical modifier keys.
 The dmg contains universal binaries (`lipo` of `aarch64-apple-darwin` and
 `x86_64-apple-darwin`) for the tray app and the CLI.
 `Pairflow.app/Contents/MacOS/pairflow-cli` is the shell binary.
+
+## Updates
+
+Windows and macOS tray builds check the public latest release
+(`GET https://api.github.com/repos/app4thathq/pairflow/releases/latest`,
+`User-Agent: pairflow`, no token). Semver tags `vX.Y.Z` are compared with the
+crate version. The asset is `pairflow-windows-x86_64.exe` or
+`pairflow-macos.dmg`. Download URLs must start on
+`github.com/app4thathq/pairflow/releases/download/` and may redirect only to
+`release-assets.githubusercontent.com` or `objects.githubusercontent.com`.
+
+Install is explicit. A launch-time check that fails or finds nothing stays
+quiet. **Check for updates** reports errors and "up to date". **Install**
+downloads to the temp directory first. On Windows a hidden PowerShell helper
+waits for this process, copies the new exe over `current_exe`, and starts it.
+SmartScreen can prompt again because the file is unsigned. On macOS, if the
+running binary is inside `Pairflow.app`, a shell helper waits for exit,
+attaches the dmg read-only, `ditto`s `Pairflow.app` over the bundle, strips
+`com.apple.quarantine`, and `open`s it. Gatekeeper can still require
+Control-click → Open. A binary that is not inside an app only opens the dmg.
+Linux has no in-app installer.
 
 ## Reconnect model
 
