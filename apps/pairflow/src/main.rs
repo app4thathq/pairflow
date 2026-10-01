@@ -1,9 +1,11 @@
 //! Pairflow command line.
 //!
 //! `pairflow host` shows a 5-character code. `pairflow join CODE` on the other
-//! computer attaches. Move the pointer off the chosen edge to control the peer.
-//! Ctrl+Alt+F12 brings the pointer back. The same code keeps working if an
-//! address changes; the client rediscovers the host and handshakes again.
+//! computer attaches. With no arguments, a console menu offers the same two
+//! roles so a double-clicked Windows executable stays open. Move the pointer
+//! off the chosen edge to control the peer. Ctrl+Alt+F12 brings the pointer
+//! back. The same code keeps working if an address changes; the client
+//! rediscovers the host and handshakes again.
 
 use clap::{Parser, Subcommand};
 use pairflow_core::discovery::{browse, machine_name, Advertiser, Announce};
@@ -77,13 +79,49 @@ enum Command {
 }
 
 fn main() {
-    let cli = Cli::parse();
     let running = Arc::new(AtomicBool::new(true));
     let flag = running.clone();
     let _ = ctrlc::set_handler(move || {
         flag.store(false, Ordering::Relaxed);
     });
-    let result = match cli.command {
+
+    // No subcommand: Explorer (and any other double-click) would otherwise
+    // print clap help and exit, and Windows would close the console immediately.
+    let (command, from_menu) = if user_args().is_empty() {
+        match interactive_menu() {
+            Some(command) => (command, true),
+            None => return,
+        }
+    } else {
+        match Cli::try_parse() {
+            Ok(cli) => (cli.command, false),
+            Err(err) => {
+                let code = err.exit_code();
+                let _ = err.print();
+                if code != 0 {
+                    pause_windows_console();
+                }
+                std::process::exit(code);
+            }
+        }
+    };
+
+    let result = dispatch(command, &running);
+    if let Err(err) = result {
+        eprintln!("pairflow: {err}");
+        if from_menu {
+            pause_windows_console();
+        }
+        std::process::exit(1);
+    }
+}
+
+fn user_args() -> Vec<String> {
+    std::env::args().skip(1).collect()
+}
+
+fn dispatch(command: Command, running: &Arc<AtomicBool>) -> Result<(), String> {
+    match command {
         Command::Host {
             code,
             new_code,
@@ -100,7 +138,7 @@ fn main() {
             dry_run,
             !no_mdns,
             !no_udp,
-            &running,
+            running,
         ),
         Command::Join {
             code,
@@ -116,12 +154,135 @@ fn main() {
             !no_mdns,
             !no_udp,
             discover_secs,
-            &running,
+            running,
         ),
-    };
-    if let Err(err) = result {
-        eprintln!("pairflow: {err}");
-        std::process::exit(1);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuChoice {
+    Host,
+    Join,
+    Quit,
+    Unknown,
+}
+
+fn interpret_menu_choice(line: &str) -> MenuChoice {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "1" | "h" | "host" => MenuChoice::Host,
+        "2" | "j" | "join" => MenuChoice::Join,
+        "q" | "quit" | "exit" => MenuChoice::Quit,
+        _ => MenuChoice::Unknown,
+    }
+}
+
+/// `Ok(None)` reuses the saved peer code. `Ok(Some)` is a normalized code.
+fn interpret_code_line(line: &str, have_saved: bool) -> Result<Option<String>, String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        if have_saved {
+            return Ok(None);
+        }
+        return Err("enter a 5-character code".into());
+    }
+    normalize_code(trimmed)
+        .map(Some)
+        .map_err(|err| err.to_string())
+}
+
+fn interactive_menu() -> Option<Command> {
+    let saved_peer = Identity::load(false, None)
+        .ok()
+        .and_then(|identity| identity.peer_code);
+    loop {
+        println!();
+        println!("Pairflow");
+        println!();
+        println!("  [1] Host — share this keyboard and mouse");
+        match &saved_peer {
+            Some(code) => {
+                println!("  [2] Join — connect with a 5-character code (Enter reuses {code})");
+            }
+            None => println!("  [2] Join — connect with a 5-character code"),
+        }
+        println!("  [q] Quit");
+        println!();
+        match read_menu_line("Choice: ") {
+            None => return None,
+            Some(line) => match interpret_menu_choice(&line) {
+                MenuChoice::Host => return Some(default_host()),
+                MenuChoice::Join => {
+                    return prompt_join_code(saved_peer.as_deref()).map(default_join);
+                }
+                MenuChoice::Quit => return None,
+                MenuChoice::Unknown => {
+                    println!("Enter 1, 2, or q.");
+                }
+            },
+        }
+    }
+}
+
+fn prompt_join_code(saved: Option<&str>) -> Option<Option<String>> {
+    loop {
+        let prompt = match saved {
+            Some(code) => format!("Pairing code [{code}]: "),
+            None => "Pairing code: ".to_string(),
+        };
+        let Some(line) = read_menu_line(&prompt) else {
+            return None;
+        };
+        match interpret_code_line(&line, saved.is_some()) {
+            Ok(code) => return Some(code),
+            Err(err) => println!("pairflow: {err}"),
+        }
+    }
+}
+
+fn read_menu_line(prompt: &str) -> Option<String> {
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line),
+    }
+}
+
+fn default_host() -> Command {
+    Command::Host {
+        code: None,
+        new_code: false,
+        side: "right".to_string(),
+        listen: "0.0.0.0:24816".to_string(),
+        dry_run: false,
+        no_mdns: false,
+        no_udp: false,
+    }
+}
+
+fn default_join(code: Option<String>) -> Command {
+    Command::Join {
+        code,
+        direct: None,
+        dry_run: false,
+        no_mdns: false,
+        no_udp: false,
+        discover_secs: 4,
+    }
+}
+
+/// Keep a Windows console open long enough to read a clap usage error.
+/// Piped stdin does not wait, so scripts that pass arguments stay unchanged.
+fn pause_windows_console() {
+    #[cfg(windows)]
+    {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            eprintln!("Press Enter to exit");
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+        }
     }
 }
 
@@ -547,4 +708,70 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_accepts_number_or_word() {
+        assert_eq!(interpret_menu_choice("1"), MenuChoice::Host);
+        assert_eq!(interpret_menu_choice(" Host "), MenuChoice::Host);
+        assert_eq!(interpret_menu_choice("2"), MenuChoice::Join);
+        assert_eq!(interpret_menu_choice("j"), MenuChoice::Join);
+        assert_eq!(interpret_menu_choice("q"), MenuChoice::Quit);
+        assert_eq!(interpret_menu_choice("quit"), MenuChoice::Quit);
+        assert_eq!(interpret_menu_choice(""), MenuChoice::Unknown);
+        assert_eq!(interpret_menu_choice("help"), MenuChoice::Unknown);
+    }
+
+    #[test]
+    fn join_prompt_reuses_saved_code_or_normalizes() {
+        assert_eq!(interpret_code_line("", true).unwrap(), None);
+        assert!(interpret_code_line("", false).is_err());
+        assert_eq!(
+            interpret_code_line("k7nq2", false).unwrap().as_deref(),
+            Some("K7NQ2")
+        );
+        assert!(interpret_code_line("ABCDO", true).is_err());
+    }
+
+    #[test]
+    fn menu_defaults_match_the_cli() {
+        match default_host() {
+            Command::Host {
+                code,
+                new_code,
+                side,
+                listen,
+                dry_run,
+                no_mdns,
+                no_udp,
+            } => {
+                assert!(code.is_none());
+                assert!(!new_code);
+                assert_eq!(side, "right");
+                assert_eq!(listen, "0.0.0.0:24816");
+                assert!(!dry_run);
+                assert!(!no_mdns && !no_udp);
+            }
+            Command::Join { .. } => panic!("host"),
+        }
+        match default_join(None) {
+            Command::Join {
+                code,
+                direct,
+                discover_secs,
+                dry_run,
+                ..
+            } => {
+                assert!(code.is_none());
+                assert!(direct.is_none());
+                assert_eq!(discover_secs, 4);
+                assert!(!dry_run);
+            }
+            Command::Host { .. } => panic!("join"),
+        }
+    }
 }
