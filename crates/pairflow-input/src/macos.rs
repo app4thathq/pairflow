@@ -59,6 +59,8 @@ pub fn open() -> Result<Input, InputError> {
         }
     }
     Ok(Input::from_channel(
+        0,
+        0,
         width,
         height,
         event_tx,

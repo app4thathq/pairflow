@@ -30,9 +30,16 @@ pub(crate) trait Platform: Send {
     fn warp(&self, x: i32, y: i32);
     fn set_exclusive(&self, on: bool);
     fn shutdown(&self);
+    /// Latest absolute cursor sample, if it changed since the previous call.
+    /// Backends use this so a full event queue cannot drop the edge position.
+    fn take_pointer(&self) -> Option<InputEvent> {
+        None
+    }
 }
 
 pub struct Input {
+    pub origin_x: i32,
+    pub origin_y: i32,
     pub width: i32,
     pub height: i32,
     event_tx: SyncSender<InputEvent>,
@@ -66,6 +73,8 @@ impl Input {
     pub fn dry_run() -> Self {
         let (event_tx, event_rx) = sync_channel(1024);
         Self {
+            origin_x: 0,
+            origin_y: 0,
             width: 1920,
             height: 1080,
             event_tx,
@@ -75,6 +84,8 @@ impl Input {
     }
 
     pub(crate) fn from_channel(
+        origin_x: i32,
+        origin_y: i32,
         width: i32,
         height: i32,
         event_tx: SyncSender<InputEvent>,
@@ -82,6 +93,8 @@ impl Input {
         ops: Box<dyn Platform>,
     ) -> Self {
         Self {
+            origin_x,
+            origin_y,
             width,
             height,
             event_tx,
@@ -102,11 +115,17 @@ impl Input {
     }
 
     pub fn try_recv(&self) -> Option<InputEvent> {
-        self.event_rx.try_recv().ok()
+        if let Ok(ev) = self.event_rx.try_recv() {
+            return Some(ev);
+        }
+        self.ops.take_pointer()
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Option<InputEvent> {
-        self.event_rx.recv_timeout(timeout).ok()
+        match self.event_rx.recv_timeout(timeout) {
+            Ok(ev) => Some(ev),
+            Err(_) => self.ops.take_pointer(),
+        }
     }
 
     pub fn inject(&self, ev: InputEvent) {

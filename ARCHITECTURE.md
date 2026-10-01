@@ -29,7 +29,9 @@ are deliberately not built yet.
 - More than two computers, or a free-form screen grid.
 - Clipboard, drag-and-drop, and file transfer.
 - Native Wayland capture (see below). XWayland can work, with weaker grabs.
-- Per-monitor layouts, mixed DPI, and cursor locking across monitor gaps.
+- Choosing which physical monitor borders the peer. The peer is the outer
+  edge of the whole desktop. Mixed-DPI gaps inside that rectangle are not
+  modeled.
 - A full GUI. The macOS app opens Terminal; other platforms are a command-line
   program with a status log.
 - The optional relay. The design is below; there is no server.
@@ -159,9 +161,12 @@ guess is not free.
 
 ## Share model
 
-The host polls (or receives) the pointer in screen coordinates, origin
-top-left, y downward. `--side right` means the peer is to the right. When the
-pointer sits in the outer 2 pixels of that edge, the host:
+The host polls (or receives) the pointer in screen coordinates, y downward.
+The desktop rectangle is every attached monitor, not only the primary, and it
+may start at a negative origin. `--side right` means the peer is past the
+outer right edge of that rectangle (not the seam between two local monitors).
+When the pointer sits in the outer 2 pixels of that edge, or a relative move
+from the last known position crosses it, the host:
 
 1. Tells the input backend to capture exclusively (grab or swallow).
 2. Sends `Enter` with the opposite edge and a fraction `0..=10000` along it.
@@ -211,7 +216,17 @@ A background thread installs `WH_MOUSE_LL` and `WH_KEYBOARD_LL` and pumps
 messages. Low-level hooks do **not** require an administrator account. They do
 not see input on the secure desktop (the lock screen, UAC prompts).
 
-- Local mode reports cursor position.
+- Before any metric or hook call, the process enables per-monitor DPI
+  awareness (falling back to system DPI awareness). `WH_MOUSE_LL` positions
+  are physical pixels; `GetSystemMetrics(SM_CXSCREEN)` on a DPI-unaware
+  process is not. v0.1.1 compared those two spaces, so a cursor pushed to the
+  right edge often never satisfied the edge test.
+- The desktop comes from `SM_XVIRTUALSCREEN` / `SM_CXVIRTUALSCREEN` (and the
+  Y pair), so a second monitor is inside the rectangle and the peer is the
+  outer edge.
+- Local mode publishes the latest cursor position (hook and an 8 ms
+  `GetCursorPos` poll). The main thread reads that sample directly, so a full
+  event queue cannot drop the position that sits on the edge.
 - Remote mode swallows the event (the hook returns 1), forwards the delta from
   an anchor, and `SetCursorPos`s back. A re-entry flag ignores the warp.
 - Events with the injected flag are ignored so the client's own `SendInput`
